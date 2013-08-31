@@ -1,57 +1,57 @@
 {
 
-  "^a" = "moveToBeginningOfLine:";
-  "^e" = "moveToEndOfLine:";
-  "^A" = "moveToBeginningOfLineAndModifySelection:";
-  "^E" = "moveToEndOfLineAndModifySelection:";
+  "^a" = moveToBeginningOfLine:;
+  "^e" = moveToEndOfLine:;
+  "^A" = moveToBeginningOfLineAndModifySelection:;
+  "^E" = moveToEndOfLineAndModifySelection:;
 
-  "~^a" = "moveToBeginningOfParagraph:";
-  "~^e" = "moveToEndOfParagraph:";
-  "~^A" = "moveToBeginningOfParagraphAndModifySelection:";
-  "~^E" = "moveToEndOfParagraphAndModifySelection:";
+  "~^a" = moveToBeginningOfParagraph:;
+  "~^e" = moveToEndOfParagraph:;
+  "~^A" = moveToBeginningOfParagraphAndModifySelection:;
+  "~^E" = moveToEndOfParagraphAndModifySelection:;
 
-  "^h" = "moveBackward:";
-  "^j" = "moveDown:";
-  "^k" = "moveUp:";
-  "^l" = "moveForward:";
-  "^H" = "moveBackwardAndModifySelection:";
-  "^J" = "moveDownAndModifySelection:";
-  "^K" = "moveUpAndModifySelection:";
-  "^L" = "moveForwardAndModifySelection:";
+  "^h" = moveBackward:;
+  "^j" = moveDown:;
+  "^k" = moveUp:;
+  "^l" = moveForward:;
+  "^H" = moveBackwardAndModifySelection:;
+  "^J" = moveDownAndModifySelection:;
+  "^K" = moveUpAndModifySelection:;
+  "^L" = moveForwardAndModifySelection:;
 
-  "~h" = "moveWordBackward:";
-  "~l" = "moveWordForward:";
-  "~H" = "moveWordBackwardAndModifySelection:";
-  "~L" = "moveWordForwardAndModifySelection:";
+  "~h" = moveWordBackward:;
+  "~l" = moveWordForward:;
+  "~H" = moveWordBackwardAndModifySelection:;
+  "~L" = moveWordForwardAndModifySelection:;
 
-  "^b" = "deleteBackward:";
-  /*"^f" = "deleteToEndOfParagraph:";*/
-  "^f" = "deleteToEndOfLine:";
+  "^b" = deleteBackward:;
+  /*"^f" = deleteToEndOfParagraph:;*/
+  "^f" = deleteToEndOfLine:;
 
-  "~d" = "deleteWordForward:";
+  "~d" = deleteWordForward:;
 
-  "^p" = "centerSelectionInVisibleArea:";
+  "^p" = centerSelectionInVisibleArea:;
 
-  "^m" = "insertNewline:";
-  "^i" = "insertTab:";
+  "^m" = insertNewline:;
+  "^i" = insertTab:;
 
-  "^y" = "paste:";
-  "^/" = "undo:";
-  "~c" = "copy:";
-  "^o" = "copy:";
-  "~v" = "paste:";
+  "^y" = paste:;
+  "^/" = undo:;
+  "~c" = copy:;
+  "^o" = copy:;
+  "~v" = paste:;
 
-  "^g" = "cancelOperation:";
+  "^g" = cancelOperation:;
 
-  "~<" = "moveToBeginningOfDocument:";
-  "~>" = "moveToEndOfDocument:";
+  "~<" = moveToBeginningOfDocument:;
+  "~>" = moveToEndOfDocument:;
 
-  "^w" = "pageUp:";
+  "^w" = pageUp:;
 
-  "^t" = "setMark:";
+  "^t" = setMark:;
   "^x" = {
-    "^x" = "swapWithMark:";
-    "^s" = "saveDocument:";
-    "^m" = "selectToMark:";
+    "^x" = swapWithMark:;
+    "^s" = saveDocument:;
+    "^m" = selectToMark:;
   };
 }
