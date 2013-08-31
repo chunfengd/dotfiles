@@ -1,0 +1,33 @@
+# to see the key binding list type:
+# $ bind -p
+# $ bind -p | grep -v -e "vi\|\(self-insert\)\|\(digit\)\|\(version\)"
+# $ bind -p | grep "\C-z"
+
+set convert-meta on
+
+"\C-h": backward-char
+"\C-l": forward-char
+"\C-j": nil
+"\C-k": nil
+
+"\M-j": next-history
+"\M-k": previous-history
+
+"\C-f": kill-line
+"\C-b": backward-delete-char
+
+"\C-i": complete
+
+"\M-h": backward-word
+"\M-l": forward-word
+
+"\C-t": set-mark
+
+"\C-\M-h": history-search-backward
+"\C-\M-l": history-search-forward
+
+"\C-o": copy-region-as-kill
+
+"\M-p": downcase-word
+"\C-/": undo
+"\C-z": undo
