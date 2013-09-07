@@ -3,6 +3,9 @@
 # $ bind -p | grep -v -e "vi\|\(self-insert\)\|\(digit\)\|\(version\)"
 # $ bind -p | grep "\C-z"
 
+set completion-ignore-case on
+set completion-map-case on
+
 $if term=dumb
 
   # disable this setting when in emacs
