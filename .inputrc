@@ -3,31 +3,39 @@
 # $ bind -p | grep -v -e "vi\|\(self-insert\)\|\(digit\)\|\(version\)"
 # $ bind -p | grep "\C-z"
 
-set convert-meta on
+$if term=dumb
 
-"\C-h": backward-char
-"\C-l": forward-char
-"\C-j": nil
-"\C-k": nil
+  # disable this setting when in emacs
 
-"\M-j": next-history
-"\M-k": previous-history
+$else
 
-"\C-f": kill-line
-"\C-b": backward-delete-char
+  set convert-meta on
 
-"\C-i": complete
+  "\C-h": backward-char
+  "\C-l": forward-char
+  "\C-j": nil
+  "\C-k": nil
 
-"\M-h": backward-word
-"\M-l": forward-word
+  "\M-j": next-history
+  "\M-k": previous-history
 
-"\C-t": set-mark
+  "\C-f": kill-line
+  "\C-b": backward-delete-char
 
-"\C-\M-h": history-search-backward
-"\C-\M-l": history-search-forward
+  "\C-i": complete
 
-"\C-o": copy-region-as-kill
+  "\M-h": backward-word
+  "\M-l": forward-word
 
-"\M-p": downcase-word
-"\C-/": undo
-"\C-z": undo
+  "\C-t": set-mark
+
+  "\C-\M-h": history-search-backward
+  "\C-\M-l": history-search-forward
+
+  "\C-o": copy-region-as-kill
+
+  "\M-p": downcase-word
+  "\C-/": undo
+  "\C-z": undo
+
+$endif
