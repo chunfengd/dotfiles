@@ -8,7 +8,7 @@ export PATH=$HOME/bin:$PATH
 # for shell
 export PS1='\h:\W \u\$ '
 alias ll='ls -lahFG'
-alias grep='grep -nI'
+# alias grep='grep'
 export JAVA_HOME=`/usr/libexec/java_home -v 1.6`
 
 # for emacs
