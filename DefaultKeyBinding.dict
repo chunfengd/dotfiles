@@ -49,9 +49,10 @@
   "^w" = pageUp:;
 
   "^t" = setMark:;
+  "^n" = selectToMark:;
   "^x" = {
     "^x" = swapWithMark:;
-    "^s" = saveDocument:;
+    /*"^s" = Save:;*/
     "^m" = selectToMark:;
   };
 }
