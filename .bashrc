@@ -16,3 +16,7 @@ export NODE_NO_READLINE=1
 export ALTERNATE_EDITOR=
 alias ec='emacsclient -c'
 export SUDO_EDITOR=emacsclient # use "sudo -e <file>" for sudo editing
+
+# for r
+export LC_CTYPE=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
