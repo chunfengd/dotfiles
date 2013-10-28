@@ -9,7 +9,7 @@ export PATH=$HOME/bin:$PATH
 export PS1='\u@\h:\W\$ '
 alias ll='ls -lahFG'
 alias grep='grep --color=auto'
-export JAVA_HOME=`/usr/libexec/java_home -v 1.6`
+# export JAVA_HOME=`/usr/libexec/java_home -v 1.6`
 
 # for emacs
 export NODE_NO_READLINE=1
