@@ -8,10 +8,10 @@ do
     file=$HOME/$f
     if [ -e $file ]; then
         echo "backup $file to $file.old"
-        mv -f $file $file.old
+        cp -f $file $file.old
     fi
     echo "link $file to $PWD/$f"
-    ln -s $PWD/$f $file
+    ln -sf $PWD/$f $file
 done
 
 # mac keybindings
@@ -24,8 +24,8 @@ if [ $(uname) == 'Darwin' ]; then
     fi
     if [ -e $BINDING_FILE ]; then
         echo "backup $BINDING_FILE"
-        mv -f $BINDING_FILE $BINDING_FILE.old
+        cp -f $BINDING_FILE $BINDING_FILE.old
     fi
     echo "link $BINDING_FILE to $PWD/DefaultKeyBinding.dict"
-    ln -s $PWD/DefaultKeyBinding.dict $BINDING_FILE
+    ln -f $PWD/DefaultKeyBinding.dict $BINDING_FILE
 fi
