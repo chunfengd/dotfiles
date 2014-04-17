@@ -21,6 +21,10 @@ export SUDO_EDITOR=emacsclient # use "sudo -e <file>" for sudo editing
 export LC_CTYPE=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
+# for postgres
+alias start_postgres='sudo su postgres -c "postgres -D /opt/local/var/db/postgresql_defaultdb"'
+
+# for local
 if [ -r $HOME/.bash.local ]; then
     source $HOME/.bash.local
 fi
