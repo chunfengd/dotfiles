@@ -32,8 +32,8 @@ $else
 
   "\C-t": set-mark
 
-  "\C-\M-h": history-search-backward
-  "\C-\M-l": history-search-forward
+  "\C-\M-k": history-search-backward
+  "\C-\M-j": history-search-forward
 
   "\C-o": copy-region-as-kill
 
