@@ -20,3 +20,7 @@ export SUDO_EDITOR=emacsclient # use "sudo -e <file>" for sudo editing
 # for r
 export LC_CTYPE=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
+
+if [ -r $HOME/.bash.local ]; then
+    source $HOME/.bash.local
+fi
