@@ -7,7 +7,7 @@ export PATH=$HOME/bin:$PATH
 
 # for shell
 export PS1='\u@\h:\W\$ '
-alias ll='ls -lahFG'
+alias ll='ls -lhFG'
 alias grep='grep --color=auto'
 # export JAVA_HOME=`/usr/libexec/java_home -v 1.6`
 
