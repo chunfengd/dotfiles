@@ -1,6 +1,6 @@
 #!/bin/bash
 
-fs=".profile .bashrc .inputrc"
+fs=".bash_aliases .inputrc"
 
 # backup old files if exist
 for f in $fs
