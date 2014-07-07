@@ -5,11 +5,15 @@ fi
 export PATH=/opt/local/bin:/opt/local/sbin:$PATH
 export PATH=$HOME/bin:$PATH
 
+#java_home
+if [ -x /usr/libexec/java_home ]; then
+    export JAVA_HOME="$(/usr/libexec/java_home)"
+fi
+
 # for shell
 export PS1='\u@\h:\W\$ '
 alias ll='ls -lhFG'
 alias grep='grep --color=auto'
-# export JAVA_HOME=`/usr/libexec/java_home -v 1.6`
 
 # for emacs
 export NODE_NO_READLINE=1
