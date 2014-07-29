@@ -25,6 +25,10 @@ export SUDO_EDITOR=emacsclient # use "sudo -e <file>" for sudo editing
 export LC_CTYPE=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
+# for time
+alias unix2date='date -jf "%s" +"%Y-%m-%d %H:%M:%S"'
+alias date2unix='date -jf "%Y-%m-%d %H:%M:%S" +%s'
+
 # for local
 if [ -r $HOME/.bash.local ]; then
     source $HOME/.bash.local
