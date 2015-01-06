@@ -15,6 +15,15 @@ export PS1='\u@\h:\W\$ '
 alias ll='ls -lhFG'
 alias grep='grep --color=auto'
 
+find_func() {
+    find . -name $1 2>/dev/null
+}
+alias findf=find_func
+# grep_func() {
+#   grep  --color=auto -i $*   2>/dev/null
+#}
+#alias grepf=grep_func
+
 # for emacs
 export NODE_NO_READLINE=1
 export ALTERNATE_EDITOR=
