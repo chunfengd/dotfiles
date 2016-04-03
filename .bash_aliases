@@ -14,6 +14,7 @@ fi
 export PS1='\u@\h:\W\$ '
 alias ll='ls -lhFG'
 alias grep='grep --color=auto'
+alias egit='GIT_EDITOR='\''emacsclient -c'\'' git'
 
 find_func() {
     find . -name $1 2>/dev/null
