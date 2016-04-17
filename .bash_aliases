@@ -12,7 +12,7 @@ fi
 
 # for shell
 export PS1='\u@\h:\W\$ '
-alias ll='ls -lhFG'
+alias ll='ls -lhF'
 alias grep='grep --color=auto'
 
 find_func() {
