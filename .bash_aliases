@@ -13,7 +13,6 @@ fi
 # for shell
 export PS1='\u@\h:\W\$ '
 alias ll='ls -lhF'
-alias egit='GIT_EDITOR='\''emacsclient -c'\'' git'
 alias grep='grep --color=auto'
 alias ndgrep='grep --exclude='\''*/node_modules/*'\'''
 alias ndjsgrep='grep --exclude='\''*/node_modules/*'\'' --include=*.js'
@@ -42,6 +41,20 @@ export LC_ALL=en_US.UTF-8
 # for time
 alias unix2date='date -jf "%s" +"%Y-%m-%d %H:%M:%S"'
 alias date2unix='date -jf "%Y-%m-%d %H:%M:%S" +%s'
+
+# for git
+alias egit='GIT_EDITOR='\''emacsclient -c'\'' git'
+source ~/git-completion.bash
+green="\[\033[0;32m\]"
+blue="\[\033[0;34m\]"
+purple="\[\033[0;35m\]"
+reset="\[\033[0m\]"
+source ~/git-prompt.sh
+export GIT_PS1_SHOWDIRTYSTATE=1
+# '\u' adds the name of the current user to the prompt
+# '\$(__git_ps1)' adds git-related stuff
+# '\W' adds the name of the current directory
+export PS1="$purple\u$green\$(__git_ps1)$purple \W $ $reset"
 
 ###################
 # platform
