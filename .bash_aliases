@@ -76,7 +76,7 @@ alias postgres_stop='sudo /opt/local/etc/LaunchDaemons/org.macports.postgresql93
 alias postgres_restart='sudo /opt/local/etc/LaunchDaemons/org.macports.postgresql93-server/postgresql93-server.wrapper restart'
 
 # alias for mongo server
-alias mongo_start='sudo mongod -f /opt/local/etc/mongodb/mongodb.conf --httpinterface &'
+alias mongo_start='sudo mongod -f /opt/local/etc/mongodb/mongodb.conf --httpinterface'
 mongostop_func () {
   local mongopid=`less /opt/local/var/db/mongodb_data/mongod.lock`;
   if [[ $mongopid =~ [[:digit:]] ]]; then
