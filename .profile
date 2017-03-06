@@ -1,4 +1,4 @@
-# echo "in profile"
+# echo "profile"
 
 if [ -f $HOME/.bashrc ]; then
     source $HOME/.bashrc
