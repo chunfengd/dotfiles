@@ -1,6 +1,6 @@
 #!/bin/bash
 
-fs=".bash_aliases .inputrc git-completion.bash git-prompt.sh"
+fs=".bash_aliases .inputrc git-completion.bash git-prompt.sh .eslintrc"
 t=`date +%s`
 
 # backup old files if exist

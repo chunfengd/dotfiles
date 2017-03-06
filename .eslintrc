@@ -1,0 +1,38 @@
+{
+    "extends": "eslint:recommended",
+    "parser": "babel-eslint",
+    "rules": {
+        "indent": 0,
+        "quotes": [
+            0
+        ],
+        "linebreak-style": [
+            2,
+            "unix"
+        ],
+        "semi": [
+            2,
+            "always"
+        ],
+        "no-console": 1,
+        "no-unused-vars": 1,
+        "no-multi-spaces": 0,
+        "comma-dangle": 0,
+        "camelcase": 0,
+        "no-underscore-dangle": 0,
+        "key-spacing": 0,
+    },
+    "env": {
+        "es6": true,
+        "browser": true,
+        "node": true,
+        "jquery": true,
+    },
+    "globals": {
+        "Waypoint": false,
+        "_": false,
+    },
+    "ecmaFeatures": {
+        "modules": true
+    }
+}
