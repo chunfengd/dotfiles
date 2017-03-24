@@ -21,18 +21,17 @@
         "camelcase": 0,
         "no-underscore-dangle": 0,
         "key-spacing": 0,
+        "strict": 1
     },
     "env": {
         "es6": true,
-        "browser": true,
         "node": true,
-        "jquery": true,
     },
     "globals": {
         "Waypoint": false,
-        "_": false,
+        "_": false
     },
-    "ecmaFeatures": {
-        "modules": true
+    "parserOptions": {
+        "sourceType": "script"
     }
 }
