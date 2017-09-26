@@ -31,6 +31,10 @@ title() {
     echo -ne "\033]0;"$*"\007"
 }
 
+daemon() {
+  $* >/dev/null 2>&1 &
+}
+
 # for emacs
 export NODE_NO_READLINE=1
 export ALTERNATE_EDITOR=
