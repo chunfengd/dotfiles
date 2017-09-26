@@ -25,6 +25,11 @@ alias findf=find_func
 #   grep  --color=auto -i $*   2>/dev/null
 #}
 #alias grepf=grep_func
+title() {
+    # setup title for iterm
+    # https://superuser.com/questions/419775/with-bash-iterm2-how-to-name-tabs
+    echo -ne "\033]0;"$*"\007"
+}
 
 # for emacs
 export NODE_NO_READLINE=1
