@@ -69,11 +69,6 @@ export PS1="$purple\u$green\$(__git_ps1)$purple \W $ $reset"
 # platform
 ###################
 
-# for iterm2
-function title {
-  echo -ne "\033]0;"$*"\007"
-}
-
 ###################
 # device
 ###################
