@@ -46,6 +46,8 @@ export LC_ALL=en_US.UTF-8
 # for time
 alias unix2date='date -jf "%s" +"%Y-%m-%d %H:%M:%S"'
 alias date2unix='date -jf "%Y-%m-%d %H:%M:%S" +%s'
+alias fileEpoch='stat -f "%Dm"'
+alias fileDatetime='stat -f "%Sm"'
 
 # for git
 alias egit='GIT_EDITOR='\''emacsclient -c'\'' git'
@@ -70,11 +72,6 @@ export PS1="$purple\u$green\$(__git_ps1)$purple \W $ $reset"
 ###################
 
 export PATH=/Applications/Emacs.app/Contents/MacOS:/Applications/Emacs.app/Contents/MacOS/bin:$PATH
-
-# java_home
-if [ -x /usr/libexec/java_home ]; then
-    export JAVA_HOME="$(/usr/libexec/java_home -v 1.7)"
-fi
 
 ###################
 # for local
