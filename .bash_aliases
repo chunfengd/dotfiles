@@ -38,10 +38,10 @@ daemon() {
 # for emacs
 export NODE_NO_READLINE=1
 export ALTERNATE_EDITOR=
-alias ecn='emacsclient -n'
-alias ec='emacsclient'
-alias ecnw='emacsclient -nw'
-export SUDO_EDITOR=emacsclient # use "sudo -e <file>" for sudo editing
+alias ecn='emacsclient -s emacs-server -n'
+alias ec='emacsclient -s emacs-server'
+alias ecnw='emacsclient -s emacs-server -nw'
+export SUDO_EDITOR='emacsclient -s emacs-server -nw' # use "sudo -e <file>" for sudo editing
 
 # for r
 export LC_CTYPE=en_US.UTF-8
@@ -64,6 +64,9 @@ export GIT_PS1_SHOWDIRTYSTATE=1
 # '\$(__git_ps1)' adds git-related stuff
 # '\W' adds the name of the current directory
 export PS1="$purple\u$green\$(__git_ps1)$purple \W $ $reset"
+
+# for docker
+alias dc=docker-compose
 
 ###################
 # platform
