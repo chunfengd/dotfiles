@@ -27,6 +27,15 @@ alias findf=find_func
 #   grep  --color=auto -i $*   2>/dev/null
 #}
 #alias grepf=grep_func
+title() {
+    # setup title for iterm
+    # https://superuser.com/questions/419775/with-bash-iterm2-how-to-name-tabs
+    echo -ne "\033]0;"$*"\007"
+}
+
+daemon() {
+  $* >/dev/null 2>&1 &
+}
 
 # for emacs
 if [ $INSIDE_EMACS ] && [ $TERM == dumb ]; then
@@ -34,10 +43,10 @@ if [ $INSIDE_EMACS ] && [ $TERM == dumb ]; then
     export NODE_NO_READLINE=1
 fi
 export ALTERNATE_EDITOR=
-alias ecn='emacsclient -n'
-alias ec='emacsclient'
-alias ecnw='emacsclient -nw'
-export SUDO_EDITOR=emacsclient # use "sudo -e <file>" for sudo editing
+alias ecn='emacsclient -s emacs-server -n'
+alias ec='emacsclient -s emacs-server'
+alias ecnw='emacsclient -s emacs-server -nw'
+export SUDO_EDITOR='emacsclient -s emacs-server -nw' # use "sudo -e <file>" for sudo editing
 
 # for r
 export LC_CTYPE=en_US.UTF-8
@@ -62,6 +71,9 @@ export GIT_PS1_SHOWDIRTYSTATE=1
 # '\$(__git_ps1)' adds git-related stuff
 # '\W' adds the name of the current directory
 export PS1="$purple\u$green\$(__git_ps1)$purple \W $ $reset"
+
+# for docker
+alias dc=docker-compose
 
 ###################
 # platform
