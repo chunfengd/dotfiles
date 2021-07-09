@@ -19,11 +19,15 @@ $else
   #"\C-j": nil
   #"\C-k": nil
 
-  "\M-n": next-history
-  "\M-p": previous-history
-
   #"\C-f": kill-line
   #"\C-b": backward-delete-char
+
+  #"\C-o": copy-region-as-kill
+
+  #"\M-p": downcase-word
+
+  "\M-n": next-history
+  "\M-p": previous-history
 
   "\C-i": complete
 
@@ -34,10 +38,6 @@ $else
 
   "\C-\M-p": history-search-backward
   "\C-\M-n": history-search-forward
-
-  #"\C-o": copy-region-as-kill
-
-  #"\M-p": downcase-word
   "\C-/": undo
   "\C-z": undo
 
