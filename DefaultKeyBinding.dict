@@ -10,6 +10,7 @@
   "~^A" = moveToBeginningOfParagraphAndModifySelection:;
   "~^E" = moveToEndOfParagraphAndModifySelection:;
 
+  /*
   "^h" = moveBackward:;
   "^j" = moveDown:;
   "^k" = moveUp:;
@@ -25,26 +26,13 @@
   "~L" = moveWordForwardAndModifySelection:;
 
   "^b" = deleteBackward:;
-  /*"^f" = deleteToEndOfParagraph:;*/
   "^f" = deleteToEndOfLine:;
 
-  "~d" = deleteWordForward:;
-
   "^p" = centerSelectionInVisibleArea:;
+  */
 
-  "^m" = insertNewline:;
-  "^i" = insertTab:;
-
-  "^y" = paste:;
-  "^/" = undo:;
-  "~c" = copy:;
+  /*
   "^o" = copy:;
-  "~v" = paste:;
-
-  "^g" = cancelOperation:;
-
-  "~<" = moveToBeginningOfDocument:;
-  "~>" = moveToEndOfDocument:;
 
   "^w" = pageUp:;
 
@@ -52,7 +40,29 @@
   "^n" = selectToMark:;
   "^x" = {
     "^x" = swapWithMark:;
-    /*"^s" = Save:;*/
     "^m" = selectToMark:;
   };
+  */
+
+  "~b" = moveWordBackward:;
+  "~f" = moveWordForward:;
+  "~B" = moveWordBackwardAndModifySelection:;
+  "~F" = moveWordForwardAndModifySelection:;
+
+  "~d" = deleteWordForward:;
+
+  "^m" = insertNewline:;
+  "^i" = insertTab:;
+
+  "^y" = paste:;
+  "^/" = undo:;
+  "~c" = copy:;
+  "~v" = paste:;
+
+  "^g" = cancelOperation:;
+  "^c" = cancelOperation:;
+
+  "~<" = moveToBeginningOfDocument:;
+  "~>" = moveToEndOfDocument:;
+
 }
