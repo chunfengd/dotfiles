@@ -1,6 +1,7 @@
 #!/bin/bash
 
-fs=".bash_aliases .inputrc .zsh_aliases .profile .zprofile"
+fs=".bash_aliases .inputrc  .zsh_aliases .profile .zprofile"
+fs=$fs" git-completion.bash git-prompt.sh .bash_git git-completion.zsh .zsh_git"
 t=`date +%s`
 
 # backup old files if exist

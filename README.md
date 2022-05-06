@@ -17,14 +17,20 @@ my dotfiles
   if [ -f ~/.bash_aliases ]; then
     . ~/.bash_aliases
   fi
+  if [ -f ~/.bash_git ]; then
+    . ~/.bash_git
+  fi
   ```
 
 3. `~/.zshrc`
   ```sh
-  if [ -f ~/.bashrc ]; then
-    . ~/.bashrc
+  if [ -f ~/.bash_aliases ]; then
+    . ~/.bash_aliases
   fi
   if [ -f ~/.zsh_aliases ]; then
     . ~/.zsh_aliases
+  fi
+  if [ -f ~/.zsh_git ]; then
+    . ~/.zsh_git
   fi
   ```
