@@ -1,6 +1,6 @@
 #!/bin/bash
 
-fs=".bash_aliases .inputrc .profile"
+fs=".bash_aliases .inputrc .zsh_aliases .profile .zprofile"
 t=`date +%s`
 
 # backup old files if exist

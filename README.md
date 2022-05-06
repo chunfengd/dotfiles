@@ -19,24 +19,12 @@ my dotfiles
   fi
   ```
 
-3. `~/.profile`
+3. `~/.zshrc`
   ```sh
   if [ -f ~/.bashrc ]; then
     . ~/.bashrc
   fi
-  ```
-
-4. `~/.zshrc`
-  ```sh
-  if [ -f ~/.bashrc ]; then
-    . ~/.bashrc
-  fi
-  export PS1="%n %1~ %# "
-  ```
-
-5. `~/.zprofile`
-  ```sh
-  if [ -f ~/.zshrc ]; then
-    . ~/.zshrc
+  if [ -f ~/.zsh_aliases ]; then
+    . ~/.zsh_aliases
   fi
   ```
