@@ -14,6 +14,8 @@ my dotfiles
 2. `~/.bashrc`
 
   ```sh
+  echo in bashrc
+
   if [ -f ~/.bash_aliases ]; then
     . ~/.bash_aliases
   fi
@@ -22,7 +24,10 @@ my dotfiles
   fi
   ```
 
-3. `~/.zshrc`
+3. (optional) `~/.bash_profile` if exists
+   copy content from `~/.profile`
+
+4. (optional) `~/.zshrc`
   ```sh
   if [ -f ~/.bash_aliases ]; then
     . ~/.bash_aliases
