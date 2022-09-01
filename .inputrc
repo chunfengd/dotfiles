@@ -33,8 +33,8 @@ $else
   #"\C-/": undo
   #"\C-z": undo
 
-  "\M-n": next-history
-  "\M-p": previous-history
+  #"\M-n": next-history
+  #"\M-p": previous-history
   "\C-\M-p": history-search-backward
   "\C-\M-n": history-search-forward
 
