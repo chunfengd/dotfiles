@@ -8,6 +8,7 @@ pairs=()
 pairs+=("bash_aliases .bash_aliases")
 pairs+=("inputrc .inputrc")
 pairs+=("zsh_aliases .zsh_aliases")
+pairs+=("tmux.conf .tmux.conf")
 
 # git
 pairs+=("git-completion.bash git-completion.bash")
