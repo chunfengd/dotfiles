@@ -34,8 +34,7 @@ for i in ${!pairs[@]}; do
         cp $file $backup_file
     fi
     echo "link $file to $PWD/$src"
-    # TODO
-    # ln -sf $PWD/$src $file
+    ln -sf $PWD/$src $file
 done
 
 # mac keybindings
