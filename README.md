@@ -24,10 +24,19 @@ my dotfiles
   fi
   ```
 
-3. (optional) `~/.bash_profile` if exists
+3. `~/.profile`
+  ```sh
+  echo "in profile"
+
+  if [ -f $HOME/.bashrc ]; then
+      source $HOME/.bashrc
+  fi
+  ```
+
+4. (optional) `~/.bash_profile` if exists
    copy content from `~/.profile`
 
-4. (optional) `~/.zshrc`
+5. (optional) `~/.zshrc`
   ```sh
   if [ -f ~/.bash_aliases ]; then
     . ~/.bash_aliases
