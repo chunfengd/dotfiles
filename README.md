@@ -48,3 +48,6 @@ my dotfiles
     . ~/.zsh_git
   fi
   ```
+6. After the init.sh, we need to manually set up the iterm2 profile as
+   the default. Go to settings -> Profiles -> Other Actions -> "Set as
+   Default".

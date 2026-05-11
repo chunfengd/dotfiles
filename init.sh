@@ -52,4 +52,19 @@ if [ $(uname) == 'Darwin' ]; then
     fi
     echo "link $BINDING_FILE to $PWD/DefaultKeyBinding.dict"
     ln -f $PWD/DefaultKeyBinding.dict $BINDING_FILE
+
+    # iTerm2 dynamic profile
+    ITERM_DP_DIR="$HOME/Library/Application Support/iTerm2/DynamicProfiles"
+    ITERM_DP_FILE="$ITERM_DP_DIR/chunfeng.json"
+    ITERM_DP_BACKUP="$backup_dir/iterm2_chunfeng.json.$t"
+    if [ ! -d "$ITERM_DP_DIR" ]; then
+        echo "mkdir $ITERM_DP_DIR"
+        mkdir -p "$ITERM_DP_DIR"
+    fi
+    if [ -e "$ITERM_DP_FILE" ]; then
+        echo "backup $ITERM_DP_FILE to $ITERM_DP_BACKUP"
+        cp "$ITERM_DP_FILE" "$ITERM_DP_BACKUP"
+    fi
+    echo "link $ITERM_DP_FILE to $PWD/iterm2_chunfeng.json"
+    ln -sf "$PWD/iterm2_chunfeng.json" "$ITERM_DP_FILE"
 fi
