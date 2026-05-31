@@ -20,6 +20,7 @@ alias ll='ls -lhF'
 alias grep='grep --color=auto'
 alias ndgrep='grep --exclude='\''*/node_modules/*'\'''
 alias ndjsgrep='grep --exclude='\''*/node_modules/*'\'' --include=*.js'
+alias mytmux='tmux attach -t main || tmux new -s main'
 
 find_func() {
     find . -name $1 2>/dev/null
