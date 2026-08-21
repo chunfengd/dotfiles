@@ -54,6 +54,7 @@ alias ecnw='emacsclient -s emacs-server -nw'
 # for time
 alias unix2date='date -jf "%s" +"%Y-%m-%d %H:%M:%S"'
 alias date2unix='date -jf "%Y-%m-%d %H:%M:%S" +%s'
+alias timer='$HOME/dev/dotfiles/timer'
 
 ###################
 # platform

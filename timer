@@ -1,0 +1,38 @@
+#!/bin/bash
+# Usage: ./timer.sh [minutes] [message]
+# Example: ./timer.sh 5
+# Example: ./timer.sh 10 "Break time!"
+# Example: ./timer.sh 0.5 "30 seconds up"
+
+minutes=${1:-5}
+message=${2:-"Time is up!"}
+
+# support fractional minutes (e.g. 0.5 = 30s)
+seconds=$(awk "BEGIN {print int($minutes*60)}")
+
+if [ "$seconds" -le 0 ]; then
+  echo "Usage: $0 [minutes] [message]"
+  exit 1
+fi
+
+echo "Timer: ${minutes} min - $message"
+echo "Press Ctrl+C to cancel"
+
+trap 'echo -e "\nCancelled."; exit 1' INT
+
+while [ $seconds -gt 0 ]; do
+  mins=$((seconds / 60))
+  secs=$((seconds % 60))
+  printf "\rTime left: %02d:%02d " $mins $secs
+  sleep 1
+  ((seconds--))
+done
+
+printf "\rTime left: 00:00 \n"
+echo "Done!"
+
+# persistent alert (stays until you click OK) + sound
+# escape quotes/backslashes for AppleScript
+message_esc=$(printf '%s' "$message" | sed 's/\\/\\\\/g; s/"/\\"/g')
+afplay /System/Library/Sounds/Glass.aiff &
+osascript -e "display alert \"$message_esc\" message \"Timer for ${minutes} minute(s) finished.\" buttons {\"OK\"} default button \"OK\" as informational"
