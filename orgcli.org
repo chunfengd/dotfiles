@@ -1,0 +1,552 @@
+#+TITLE: Learning orgcli
+#+SEQ_TODO: TODO(t) PROG(p) | DONE(d)
+
+A hands-on plan for learning =orgcli=, the CLI in =meta-dotfiles/bin/orgcli= for reading and writing large org files. Nine short sessions, about 2 hours total. Mark each one DONE as you go (=C-c C-t= on the heading).
+
+Every exercise runs against a throwaway =/tmp/practice.org= except session 8, which is read-only against the real notes. Nothing here can damage =~/gdrive/org-meta=, and the outage exercises in session 5 use =ORGCLI_FAULT=, which fakes a broken mount without going near the real one.
+
+Two conventions used below: =$= starts a shell command, and inside org examples a leading =,*= is org's escape for a literal star at column 0.
+
+* DONE session 0: setup
+Five minutes. Confirm the tool is installed and build the practice file.
+
+** steps
+#+begin_src sh
+  # devserver
+  $ META_DOTFILES_ROOT=~/meta-dotfiles
+  # mac
+  $ META_DOTFILES_ROOT=/Users/chunfengd/dev/meta-dotfiles
+  $ alias orgcli=$META_DOTFILES_ROOT/bin/orgcli
+
+  $ orgcli --version           # 1.0.0; if "command not found", run ~/meta-dotfiles/install.sh
+  $ orgcli --help              # the whole command list, addressing, exit codes
+#+end_src
+
+Now build the practice file:
+
+#+begin_src sh
+  $ $META_DOTFILES_ROOT/docs/practice-setup.sh
+#+end_src
+
+It writes =/tmp/practice.org=: a miniature of =tools.org= with nested subtrees, a property drawer, a src block, a =TODO= state, a =** description= child, and a title containing a literal slash. Re-run it at any point to reset, which you will want after the destructive exercise in session 5.
+
+** check
+#+begin_src sh
+  $ orgcli outline -f /tmp/practice.org
+#+end_src
+Twelve headings across four top-level nodes: =acl=, =scuba=, =ssh / sush=, =empty=.
+
+** tip
+Typing =-f /tmp/practice.org= gets old fast:
+#+begin_src sh
+  $ export ORGCLI_FILE=/tmp/practice.org    # then -f is optional
+#+end_src
+Unset it before session 8. The examples below keep =-f= explicit so you can copy any one of them in isolation.
+
+* DONE session 1: see the shape of a file
+Ten minutes. =outline= is the command you will use most. It turns a file you cannot afford to read into a map you can.
+
+** steps
+#+begin_src sh
+  # every heading
+  $ orgcli outline -f /tmp/practice.org
+
+  # top level only
+  $ orgcli outline -f /tmp/practice.org --depth 1
+
+  # + lines and bytes per node
+  $ orgcli outline -f /tmp/practice.org --stats
+
+  # + each node's summary
+  $ orgcli outline -f /tmp/practice.org --desc
+
+  # scope to one subtree
+  $ orgcli outline -f /tmp/practice.org --path acl
+  $ orgcli outline -f /tmp/practice.org --stat --path "acl/bulk edit"
+
+  # only nodes with a TODO state
+  $ orgcli outline -f /tmp/practice.org --todo
+#+end_src
+
+Things to notice:
+- The left column is the line number. It is a real address you can pass back in as =--line=.
+- =--stats= exists so you can price a read before paying for it. =(30L 1.2K)= means the subtree is 30 lines and 1.2 KB.
+- =--depth= counts the scope root as 1, so =--path acl --depth 2= gives =acl= plus its direct children.
+
+** exercise
+1. Show only =acl= and its direct children, with sizes.
+   #+begin_src sh
+     $ orgcli outline -f /tmp/practice.org --path acl --depth 2 --stat
+   #+end_src
+2. Find the largest top-level node in the file without reading any of them.
+   #+begin_src sh
+     $ orgcli outline -f /tmp/practice.org --depth 1 --stat
+   #+end_src
+
+* DONE session 2: find and read one node
+Fifteen minutes. The read ladder is =outline= to =search= to =show=, cheapest first. Reach for =show= only once you know what you want.
+
+** steps
+#+begin_src sh
+  # regex over everything
+  $ orgcli search -f /tmp/practice.org 'hipstercli'
+  # + surrounding lines
+  $ orgcli search -f /tmp/practice.org 'hipstercli' --context 1
+  # headings only
+  $ orgcli search -f /tmp/practice.org --in heading 'sc'
+  # literal, no regex escaping
+  $ orgcli search -f /tmp/practice.org --fixed '$ACL'
+
+  ## show
+  # the whole subtree
+  $ orgcli show -f /tmp/practice.org --path acl
+  # its own body, no children
+  $ orgcli show -f /tmp/practice.org --path acl --depth 1
+  # just the skeleton
+  $ orgcli show -f /tmp/practice.org --path acl --headings-only
+  # cap a node you do not trust
+  $ orgcli show -f /tmp/practice.org --path acl --max-lines 5
+#+end_src
+
+Every =search= hit reports the path of the node that owns the line, so a hit is always something you can turn straight into a =show=.
+
+** exercise
+1. Find every line mentioning =scuba=, in headings only.
+   #+begin_src sh
+     $ orgcli search -f /tmp/practice.org --in heading 'scuba'
+   #+end_src
+2. =grep= told you line 9 is interesting but not which node it is in. Find out.
+   #+begin_src sh
+     $ orgcli path -f /tmp/practice.org --line 9
+   #+end_src
+
+** check
+#+begin_src sh
+$ orgcli path -f /tmp/practice.org --line 9
+#+end_src
+=acl/scuba columns=, with =match=containing= in the summary: line 9 is a bullet inside that node, not its heading. That is the bridge from a raw =grep= hit or an editor cursor position back to an address you can pass to =show= or =append=.
+
+=path= is the only command that accepts a non-heading line. Everywhere else =--line= must land exactly on a heading, so that =delete --line 9= fails loudly instead of removing the node that happens to contain line 9.
+
+* DONE session 3: address nodes precisely
+Fifteen minutes. Every node-targeting command takes exactly one of =--path=, =--line=, =--id=. Getting comfortable here makes everything else safe.
+
+** steps
+#+begin_src sh
+  # full path
+  $ orgcli show -f /tmp/practice.org --path 'acl/bulk edit/copy_permissions'
+  # same node
+  $ orgcli show -f /tmp/practice.org --path copy_permissions
+  # case-insensitive
+  $ orgcli show -f /tmp/practice.org --path COPY_PERMISSIONS
+#+end_src
+
+A path does not have to start at the top: the segments only have to form a contiguous parent-to-child chain. =--path copy_permissions= works because that title is unique.
+
+Now the two cases that trip people up.
+
+*** ambiguity is an error, never a guess
+#+begin_src sh
+$ orgcli show -f /tmp/practice.org --path description ; echo "exit=$?"
+#+end_src
+There is only one =description= here so it resolves. Add a second one and try again:
+#+begin_src sh
+$ orgcli add -f /tmp/practice.org --parent acl --title description
+$ orgcli show -f /tmp/practice.org --path description ; echo "exit=$?"
+#+end_src
+Exit 4, plus a =---CANDIDATES---= list of =<line> <full path>=. Fix it by lengthening the path (=--path acl/description=) or by using =--line= from the list. Then clean up:
+#+begin_src sh
+$ orgcli delete -f /tmp/practice.org --path acl/description --yes
+#+end_src
+
+*** slashes inside a title
+Nine of the 121 top-level titles in your real =tools.org= contain a literal slash — =hg / jf / sl=, =misc tools/services=, =x509 / certificate / certs= and six more. Both of these work:
+#+begin_src sh
+  # escaped, always correct
+  $ orgcli show -f /tmp/practice.org --path 'ssh \/ sush'
+  # unescaped, falls back
+  $ orgcli show -f /tmp/practice.org --path 'ssh / sush'
+#+end_src
+The escaped form is what =path= and =outline --json= hand back, so it is what to use when you are passing an address between commands. The unescaped form is a convenience: if the segmented reading matches nothing, the whole string is retried as one title.
+
+*** IDs, for when a path is not stable enough
+#+begin_src sh
+  # exit 1: no ID yet
+  $ orgcli id -f /tmp/practice.org --path acl
+  # mint one
+  $ orgcli id -f /tmp/practice.org --path acl --ensure
+
+  $ uuid=67cb1c5b-d311-42c5-838c-75dc4c2e0041
+  $ orgcli show -f /tmp/practice.org --id $uuid
+#+end_src
+Nodes have no ID until you ask for one. Mint one when you expect to edit the same node repeatedly across a long session, or when its title may change under you. It is a standard org-id, so Emacs understands it too.
+
+** exercise
+Address the =sql= node three different ways: by path, by line, and by ID.
+#+begin_src sh
+  $ orgcli show -f /tmp/practice.org --path sql
+
+  $ orgcli id -f /tmp/practice.org --path sql --ensure
+  $ uuid=eeea7ecd-8c0a-4273-9bae-caac318cd20e
+  $ orgcli show -f /tmp/practice.org --id $uuid
+
+  $ orgcli outline -f /tmp/practice.org --path sql
+  $ orgcli show -f /tmp/practice.org --line 26
+#+end_src
+
+** check
+All three print the same =hash== in the =---NODE---= line. That hash is the subject of the next two sessions.
+
+* DONE session 4: your first writes
+Fifteen minutes. Three commands cover most editing. All of them take =--dry-run=, and you should use it until the shape of the output stops surprising you.
+
+** steps
+#+begin_src sh
+# always look first
+$ orgcli append -f /tmp/practice.org --path 'acl/hipstercli' --text '- new bullet' --dry-run
+
+# then do it
+$ orgcli append -f /tmp/practice.org --path 'acl/hipstercli' --text '- new bullet'
+
+$ orgcli prepend -f /tmp/practice.org --path 'acl/hipstercli' --text '- goes first'
+$ orgcli set-body -f /tmp/practice.org --path 'acl/hipstercli' --text '- replaces everything'
+#+end_src
+
+Three rules worth internalising:
+- =append= lands at the end of the node's *own* body, before its first child heading, not at the end of the subtree.
+- =prepend= lands after any =SCHEDULED:= line and after the =:PROPERTIES:= drawer, so it never breaks the drawer.
+- =set-body= replaces the body and keeps the children. Pass =--include-children= if you really mean to discard the subtree.
+
+*** multi-line text: use stdin
+Org bodies are full of =*=, ===, =$= and backticks, and shell quoting is the usual way a hand-built command corrupts a note. A quoted heredoc sidesteps all of it:
+#+begin_src sh
+orgcli set-body -f /tmp/practice.org --path 'acl/hipstercli' --text-file - <<'EOF'
+- =hipstercli add --reason $TASK --poc ONCALL:$ONCALL=
+- see also: =hipstercli diff create --title "$DIFF_TITLE"=
+- cost: $0, unless you count the review
+EOF
+#+end_src
+Note the quoted =<<'EOF'=: without the quotes the shell would expand =$TASK= and =$DIFF_TITLE= to nothing before orgcli ever saw them.
+
+To write a body that itself contains a =#+begin_src= block, put it in a file and use =--text-file that-file= rather than fighting a nested heredoc.
+
+** exercise
+1. Preview adding a bullet to =scuba/sql=, then apply it.
+2. Give =acl= a body line without disturbing its =:DESCRIPTION:= drawer or any of its three children.
+
+** check
+#+begin_src sh
+$ orgcli show -f /tmp/practice.org --path acl --depth 1
+#+end_src
+The drawer is intact and your line is there. =outline --path acl= still shows all three children, and =bulk edit= still has its own two.
+
+* TODO session 5: write safely
+Twenty-five minutes. The most valuable session here. Three mechanisms: a hash guard against concurrent edits, backups against everything else, and a mirror plus a queue against the gdrive mount dying under you.
+
+** the hash guard
+Every read prints a =hash== of the target subtree. Pass it back as =--if-match= and the write refuses (exit 3) if anything changed in between.
+
+#+begin_src sh
+  $ h=$(orgcli show -f /tmp/practice.org --path 'acl/scuba columns' --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["hash"])'); echo $h
+  $ h=$(orgcli show -f /tmp/practice.org --path 'acl/scuba columns' --json | jq -r '.hash'); echo $h
+
+  $ orgcli append -f /tmp/practice.org --path 'acl/scuba columns' --text '- =deciding_result=' --if-match "$h"
+
+  # exit 3, refuses
+  $ orgcli append -f /tmp/practice.org --path 'acl/scuba columns' --text '- again' --if-match "$h" ; echo "exit=$?"
+#+end_src
+
+The second call fails because the first one changed the node, so your hash is stale. This is the only thing standing between you and silently clobbering an edit made by Emacs, or by another agent, while you were reading. Read, write with the hash you read, re-read if it fails.
+
+** backups
+Every write copies the file first, before touching it. =restore= is the UI:
+#+begin_src sh
+$ orgcli restore --list -f /tmp/practice.org
+$ orgcli restore -f /tmp/practice.org --backup practice.org.20260830-141530-1234 --dry-run
+$ orgcli restore -f /tmp/practice.org --backup practice.org.20260830-141530-1234
+#+end_src
+Backups are named =<file>.<timestamp>-<pid>=, newest 50 kept per file, under =$ORGCLI_BACKUP_DIR=. Restoring takes its own backup first, so it is itself undoable. =--no-backup= skips the copy, which is only worth doing in a loop over a scratch file.
+
+** exercise: break something on purpose
+1. =set-body= over =acl= with =--include-children=, destroying its subtree.
+2. Confirm the damage with =outline --path acl=.
+3. =orgcli restore --list -f /tmp/practice.org=, then restore the newest one.
+4. Confirm the children are back.
+
+** check
+Recover the backup:
+#+begin_src sh
+$ orgcli restore --list -f /tmp/practice.org
+$ orgcli restore -f /tmp/practice.org --backup <the newest name>
+$ orgcli outline -f /tmp/practice.org --path acl
+#+end_src
+Doing this once, on purpose, is worth more than reading about it.
+
+** when the mount is down
+The notes live on a gdrive FUSE mount that dies periodically. orgcli degrades rather than blocking, which is convenient but changes what success means, so this is worth practising before you meet it for real.
+
+=ORGCLI_FAULT= fakes an outage. It is inert unless set, and it never touches the real mount:
+
+| =read= | reads fail |
+| =write= | writes fail |
+| =rename= | only the final atomic rename fails |
+| =both= | reads and writes fail |
+| =hang= | everything blocks, to test =ORGCLI_TIMEOUT= |
+
+First, a read with the mount "down":
+#+begin_src sh
+  $ ORGCLI_FAULT=read orgcli show -f /tmp/practice.org --path acl ; echo "exit=$?"
+#+end_src
+Exit 5. By default orgcli keeps no copy of your notes, so an unreachable file is simply unreachable.
+
+Now opt in to the mirror and try again:
+#+begin_src sh
+  # a healthy read, which now records a copy
+  $ ORGCLI_MIRROR=1 orgcli outline -f /tmp/practice.org --depth 1
+
+  $ ORGCLI_FAULT=read orgcli show -f /tmp/practice.org --path acl
+#+end_src
+This time it works, and warns on *stderr* that it served a mirrored copy. The warning is never on stdout, so =--json= stays parseable. Note the asymmetry: =ORGCLI_MIRROR= governs *recording*, so once a copy exists it is served whether or not the variable is still set. To stop that, clear =$ORGCLI_CACHE_DIR/mirror=.
+
+Now a write:
+#+begin_src sh
+$ ORGCLI_FAULT=write orgcli append -f /tmp/practice.org --path acl --text '- offline note'
+$ grep 'offline note' /tmp/practice.org ; echo "in the file? exit=$?"
+$ orgcli pending
+#+end_src
+
+Read that result carefully. It says =status=queued=, exits *0*, and the text is *not in the file*. The edit is safe on local disk under =~/.cache/orgcli/pending=; it has not reached gdrive. An agent that checks only the exit code will get this wrong, which is exactly why the status string says so. Never report a queued edit as saved.
+
+Draining the queue:
+#+begin_src sh
+$ orgcli sync --dry-run       # what would be applied
+$ orgcli sync                 # apply it
+$ orgcli pending ; echo "exit=$?"   # exit 1 means everything is flushed
+$ grep 'offline note' /tmp/practice.org
+#+end_src
+A write command drains its own file's queue first and prints =---SYNCED---=, so in normal use you rarely run =sync= by hand.
+
+** exercise: a conflict
+Each queued edit remembers the hash of the content it was computed against. Make that hash go stale and watch sync refuse:
+
+#+begin_src sh
+$ ORGCLI_FAULT=write orgcli append -f /tmp/practice.org --path acl --text '- queued'
+$ echo '* intruder' >> /tmp/practice.org      # pretend Emacs edited it meanwhile
+$ orgcli sync ; echo "exit=$?"
+#+end_src
+
+Exit 3, a =---CONFLICTS---= block, and the edit *kept* in the queue rather than guessed at. It prints the path of the queued content so you can diff it against the live file. Then choose:
+#+begin_src sh
+$ orgcli sync --force                    # apply anyway (backs up first)
+$ orgcli pending --drop <id>             # or abandon the edit
+#+end_src
+
+** check
+#+begin_src sh
+  # 1 == nothing waiting
+  $ orgcli pending ; echo "exit=$?"
+
+  # same missing file, two different answers
+  $ ORGCLI_FAULT=read orgcli show -f /tmp/nonexistent.org --path x ; echo "exit=$?"
+  $ orgcli show -f /tmp/nonexistent.org --path x ; echo "exit=$?"
+#+end_src
+With the fault it is exit 5, storage unavailable — the only exit code worth retrying. Without it, a merely wrong path is exit 2. Getting those two confused is how an agent ends up re-creating a node that was there all along.
+
+In real life, fixing the mount beats working around it — remount, then =orgcli sync=. The queue exists so a mount that dies mid-session does not cost you the edit, not as a substitute for a working mount.
+
+* DONE session 6: structure and metadata
+Fifteen minutes. Creating and removing nodes, then the metadata commands that change a heading without touching its body.
+
+** structure
+#+begin_src sh
+$ orgcli add -f /tmp/practice.org --parent acl --title 'links'
+$ orgcli add -f /tmp/practice.org --parent acl --title 'intro' --position first
+$ orgcli add -f /tmp/practice.org --parent acl --title 'amp' --before 'bulk edit'
+$ orgcli add -f /tmp/practice.org --root --title 'newtool' --text '- first note'
+
+$ orgcli set-heading -f /tmp/practice.org --path newtool --title 'new tool'
+$ orgcli delete -f /tmp/practice.org --path 'new tool' --dry-run
+$ orgcli delete -f /tmp/practice.org --path 'new tool' --yes
+#+end_src
+
+- The new node's level is inferred from its parent. =--root= makes a top-level one; there is no implicit default, so a typo in =--parent= fails loudly instead of quietly appending a stray heading at the end of your file.
+- =delete= removes the whole subtree and needs =--yes=. Preview with =--dry-run= first, always.
+- There is deliberately no move, refile, promote or demote. Restructuring a file is a job for Emacs, where you can see what you are doing.
+
+** metadata
+#+begin_src sh
+  $ orgcli todo -f /tmp/practice.org --path scuba --state DONE
+  $ orgcli todo -f /tmp/practice.org --path scuba --state DONE --log-state
+  # this remove the TODO tag
+  $ orgcli todo -f /tmp/practice.org --path scuba --clear
+
+  $ orgcli tag -f /tmp/practice.org --path acl --add security,infra
+  $ orgcli tag -f /tmp/practice.org --path acl --remove infra
+
+  $ orgcli prop -f /tmp/practice.org --path acl --set OWNER=chunfengd
+  $ orgcli props -f /tmp/practice.org --path acl
+  $ orgcli prop -f /tmp/practice.org --path acl --unset OWNER
+#+end_src
+
+- =todo= validates against the file's own =#+TODO:= / =#+SEQ_TODO:= keywords, which differ between your files: =daily.org= uses =PROG= and =CANCELLED=, =monthly.org= uses =INPROGRESS= and =CANCELED=. =--force= overrides.
+- =--log-state= writes a =- State "DONE" from "TODO" [ts]= line in exactly the shape Emacs writes, into the =:LOGBOOK:= drawer if the node has one.
+- Tags may only contain letters, digits and =_ @ # %=. Anything else is rejected rather than written, because org would not read it back as a tag and the text would silently become part of your heading.
+- =prop= removes the drawer entirely when you unset the last property.
+
+** exercise
+Build =acl/notes= from nothing: create it, give it a body, an ID, a =:DESCRIPTION:=, and a =security= tag. Then delete it in one command.
+
+** check
+=orgcli show --path acl/notes= before deleting shows one drawer holding both the ID and the description. =delete --path acl/notes --yes= takes the whole thing.
+
+* DONE session 7: descriptions and the index
+Ten minutes. This is the part that makes the notes navigable by something other than you.
+
+** two forms, one writer
+A description is a one-line summary so a reader can route from =outline= alone instead of opening bodies. Reads accept both forms; writes always produce the property.
+
+#+begin_src org
+,* acl
+:PROPERTIES:
+:DESCRIPTION: ACL management: audit columns, bulk edits, hipstercli.
+:END:
+
+,* scuba
+,** description
+Scuba query recipes and dataset discovery.
+#+end_src
+
+The child form is the older convention and 23 of your real =tools.org= nodes still use it, which is why reads understand it. The property is preferred because a child heading eats an outline slot and stops making sense below level 1.
+
+#+begin_src sh
+  # source=property
+  $ orgcli describe -f /tmp/practice.org --path acl
+  # source=child
+  $ orgcli describe -f /tmp/practice.org --path scuba
+  # exit 1, none
+  $ orgcli describe -f /tmp/practice.org --path empty; echo "exit=$?"
+
+  # add a discription
+  $ orgcli describe -f /tmp/practice.org --path empty --text 'A node with nothing in it.'
+  # find top nodes miss description
+  $ orgcli describe -f /tmp/practice.org --missing --depth 1
+  # child form -> property
+  $ orgcli migrate-descriptions -f /tmp/practice.org --dry-run
+#+end_src
+
+** the index
+=index= regenerates =<file>.index.md=, one bullet per top-level heading with its description. That 8 KB file is what stands in for a 258 KB =tools.org= when something needs to pick a topic.
+
+#+begin_src sh
+$ orgcli index -f /tmp/practice.org --dry-run
+$ orgcli index -f /tmp/practice.org
+$ cat /tmp/practice.index.md
+#+end_src
+
+Re-run it after adding, removing or renaming a top-level heading. It also reports duplicate titles, because duplicates are what make =--path= ambiguous later.
+
+** exercise
+Give every top-level node in the practice file a description, then regenerate the index and read it. That file is the whole point of the exercise: it should be enough to choose a node from, without opening the org file at all.
+
+* DONE session 8: the real notes
+Fifteen minutes. Everything below is read-only against =~/gdrive/org-meta=. Unset =ORGCLI_FILE= first if you set it in session 0.
+
+** steps
+A bare name resolves against =$ORGCLI_DIR=, so =-f tools= means =~/gdrive/org-meta/tools.org=.
+
+#+begin_src sh
+  $ GDRIVE_FOLDER=~/gdrive
+  $ GDRIVE_FOLDER="/Users/chunfengd/Google Drive/My Drive"
+  $ export ORGCLI_DIR="$GDRIVE_FOLDER/org-meta"
+
+  # ~120 nodes, the routing table
+  $ orgcli outline -f tools --depth 1 --desc --stats
+  # a file that nests 12 deep
+  $ orgcli outline -f storage --depth 3
+  # everything with a TODO state
+  $ orgcli outline -f daily --todo --depth 2
+
+  $ orgcli search -f tools 'hipstercli' --context 1
+  $ orgcli show -f tools --path 'acl/bulk edit/copy_permissions'
+  $ orgcli describe -f tools --missing --depth 1       # most nodes have none yet
+
+  $ orgcli index -f tools --dry-run                    # preview only, writes nothing
+#+end_src
+
+That last one will show =tools.index.md= has drifted: at the time of writing it reports three additions and two removals — the =hg= entry is stale (the heading is now =hg / jf / sl=), =TODO KFS= should be =KFS=, and =misc= is new. Apply it with a plain =orgcli index -f tools= whenever you want. Nothing above this line writes anything.
+
+** exercise
+Answer these three without opening a file in Emacs:
+1. Which =tools.org= node is the largest, and how big is it?
+2. How many top-level nodes mention =smc=? Watch the =---SUMMARY---= line: =search= stops at =--limit 50= by default and says =truncated=yes= when it does, so a plain search cannot answer a counting question.
+3. What does the =keanu= node say it is for?
+
+** check
+One =outline --depth 1 --stats=, one =search --limit 500=, one =describe=. At the time of writing that is =servicerouter= at about 410 lines, =smc= across 27 top-level nodes, and Keanu described as Meta's traffic-shifting CLI for VIP region weights. Your numbers will differ as the notes grow: the point is the route you took, not the answer. If you found yourself running =show= on something big, you skipped a rung on the ladder.
+
+* reference: cheat sheet
+** the read ladder, cheapest first
+#+begin_src sh
+$ orgcli outline -f F --depth 1 --desc --stats   # map the file
+$ orgcli search  -f F 'pattern' --context 1      # locate a line
+$ orgcli show    -f F --path P                   # read one node
+$ orgcli path    -f F --line N                   # line number -> address
+#+end_src
+
+** the safe write
+#+begin_src sh
+$ h=$(orgcli show -f F --path P --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["hash"])')
+$ orgcli append -f F --path P --if-match "$h" --text-file - <<'EOF'
+- new content
+EOF
+#+end_src
+
+** addressing
+| form           | when                                                   |
+| =--path 'a/b/c'= | normal use; any depth; ambiguity is exit 4             |
+| =--line N=       | after a grep, or to break a tie from =---CANDIDATES---=  |
+| =--id UUID=      | a node you will edit repeatedly; mint with =id --ensure= |
+
+=--line= must be a heading line everywhere except =path=, which resolves any line to the node containing it. That asymmetry is deliberate: it makes =path= useful on grep output without making =delete --line= dangerous.
+
+** recovering
+#+begin_src sh
+$ orgcli pending              # queued edits; exit 1 == everything is flushed
+$ orgcli sync                 # replay them; exit 3 == conflict, nothing guessed
+$ orgcli sync --force         # apply over a conflict, backing up first
+$ orgcli pending --drop ID    # abandon one queued edit
+$ orgcli restore --list -f F  # pre-write backups
+$ orgcli restore -f F --backup NAME
+#+end_src
+
+=status=queued= means the edit is on local disk and *not* on gdrive. Exit 0 either way, so read the status, not just the code.
+
+** exit codes
+| 0 | ok |
+| 1 | no match: the address resolved to nothing, or a search found nothing |
+| 2 | usage or file error: fix the command |
+| 3 | =--if-match= failed, or a sync conflict: re-read, retry with the new hash |
+| 4 | ambiguous =--path=: see =---CANDIDATES---=, lengthen the path or use =--line= |
+| 5 | storage unavailable: the mount is down. The only code worth retrying |
+
+** environment
+- =ORGCLI_FILE=: default for =-f=
+- =ORGCLI_DIR=: where bare names resolve, default =~/gdrive/org-meta=
+- =ORGCLI_BACKUP_DIR=: default =~/.cache/orgcli/backups=
+- =ORGCLI_CACHE_DIR=: mirror and queue, default =~/.cache/orgcli=
+- =ORGCLI_TIMEOUT=: seconds before a hung mount is given up on, default 10
+- =ORGCLI_MIRROR=1=: record every read to the mirror, so reads keep working while the mount is down, and several edits can stack in the queue. *Off by default* — it puts a second copy of your notes on local disk that can be served in place of the real file. It governs recording only: an existing mirror is still served, so to stop that, clear =$ORGCLI_CACHE_DIR/mirror=. The write queue chains its edits regardless, so this setting can never make a queued edit unsound
+- =ORGCLI_NO_QUEUE=1=: fail writes outright instead of queueing them
+- =ORGCLI_FAULT=: =read=, =write=, =rename=, =both= or =hang= — fake an outage
+
+** getting unstuck
+#+begin_src sh
+$ orgcli guide                # the agent workflow page, the short version of this doc
+$ orgcli <command> --help     # flags plus worked examples for every command
+#+end_src
+
+* reference: when not to use orgcli
+- *Restructuring.* No move, refile, promote or demote, on purpose. Reorganising a file is easier in Emacs where you can see the whole tree.
+- *Prose editing.* For rewriting a paragraph in place, open the file. orgcli is for whole-body replacement, not for fiddling with a sentence.
+- *Anything not addressable as a node.* File-level =#+PROPERTY:= headers, the preamble above the first heading, the inside of a table. Use an editor.
+- *When you already have the file open.* If Emacs is holding the buffer, edit there. orgcli's hash guard detects a conflict but cannot merge one.
