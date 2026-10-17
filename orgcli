@@ -1,0 +1,3177 @@
+#!/usr/bin/env python3
+"""orgcli - structured read/write access to large org-mode files.
+
+Address one node, read one node, change one node. Nothing here ever needs the
+whole file in an agent's context: `outline` gives a map with per-node sizes,
+`search` gives line hits, `show` gives exactly one subtree.
+
+Every edit is a line splice on the original line list, so bytes the tool did
+not target round-trip exactly - no reflowing, no re-indenting, no normalising
+of anything it did not touch. `tests/test_orgcli.py` asserts that invariant
+against the real note corpus.
+
+Addressing (node-targeting commands take exactly one):
+
+    --path 'acl/bulk edit/copy_permissions'
+        '/'-separated, case-insensitive, whitespace-normalised. A literal
+        slash inside a title is escaped '\\/'. The segments must form a
+        contiguous ancestor chain but need not start at level 1, so
+        --path copy_permissions works like a plain title lookup at any depth.
+        Ambiguity is never guessed: exit 4 with every candidate listed.
+    --id 4f3a1c8e-...      org-id UUID from the node's :PROPERTIES: drawer.
+    --line 2359            a heading must start exactly on that line.
+
+Writes take --dry-run (unified diff, no write), --if-match <hash> (refuse if
+the subtree changed since you read it) and back the file up first unless
+--no-backup.
+
+The notes live on a gdrive FUSE mount that dies periodically, so a write orgcli
+cannot deliver is queued rather than lost: it reports status=queued and is
+replayed by the next write to that file, or by `orgcli sync`. status=queued
+means the edit is safe on local disk and is *not* on gdrive. An unreachable
+read is exit 5; set ORGCLI_MIRROR=1 to keep a local copy of every file read and
+serve that instead. See `orgcli guide` section 7.
+
+Exit codes: 0 ok, 1 no match, 2 usage/file error, 3 --if-match failed or sync
+conflict, 4 ambiguous match, 5 storage unavailable (the only one worth
+retrying).
+
+Run `orgcli guide` for the recommended agent workflow.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import errno
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import sys
+import tempfile
+import time
+import uuid
+
+# ---------------------------------------------------------------------------
+# Exit codes. 0/1/2/4 match the cfnote scripts these replace; 3 and 5 are new.
+# ---------------------------------------------------------------------------
+
+EXIT_OK = 0
+EXIT_NO_MATCH = 1
+EXIT_USAGE = 2
+EXIT_PRECONDITION = 3
+EXIT_AMBIGUOUS = 4
+EXIT_UNAVAILABLE = 5
+
+# Used when a file declares no #+TODO:/#+SEQ_TODO: of its own. The corpus needs
+# this: tools.org declares nothing yet has headings like "* TODO KFS", and the
+# files that do declare keywords disagree with each other (daily.org has PROG
+# and CANCELLED, monthly.org has INPROGRESS and CANCELED). The fallback is the
+# union of everything actually in use, so a keyword is never mistaken for the
+# first word of a title.
+DEFAULT_TODO = ["TODO", "PROG", "INPROGRESS", "NEXT", "WAITING", "HOLD"]
+DEFAULT_DONE = ["DONE", "CANCELLED", "CANCELED", "MISS"]
+
+DEFAULT_ORG_DIR = "~/gdrive/org-meta"
+DEFAULT_CACHE_DIR = "~/.cache/orgcli"
+DEFAULT_BACKUP_DIR = "~/.cache/orgcli/backups"
+BACKUP_KEEP = 50
+
+HASH_LEN = 12
+
+# How long any single command may spend in the filesystem before we give up and
+# call the mount hung. 0 disables. See note in run_with_timeout(): a FUSE call
+# in uninterruptible sleep cannot be cut short from Python, so this is a good
+# guard against a slow mount and a weak one against a wedged one.
+DEFAULT_TIMEOUT = 10
+
+# errnos that mean "the storage went away", as opposed to "you asked for the
+# wrong thing". A dead fuse.rclone mount gives ENOTCONN; a mount that was
+# unmounted underneath us gives ENOENT (handled separately, in
+# classify_oserror); gdrive quota exhaustion gives EDQUOT/ENOSPC.
+STORAGE_ERRNOS = frozenset(x for x in (
+    getattr(errno, name, None) for name in (
+        "EIO", "ENOTCONN", "ESTALE", "EROFS", "ENOSPC", "EDQUOT", "ENODEV",
+        "ETIMEDOUT", "EHOSTDOWN", "EHOSTUNREACH", "ENXIO", "EREMOTEIO",
+    )) if x is not None)
+
+# ---------------------------------------------------------------------------
+# Line-level regexes. All match against newline-stripped text, never raw lines.
+# ---------------------------------------------------------------------------
+
+HEADING_RE = re.compile(r"^(\*+)[ \t]+(.*)$")
+# A bare "*" line with no title is a valid org heading too, but never appears in
+# this corpus and matching it would swallow bullet lines. Require the space.
+
+BEGIN_RE = re.compile(r"^[ \t]*#\+begin_(\S+)", re.IGNORECASE)
+END_RE = re.compile(r"^[ \t]*#\+end_(\S+)", re.IGNORECASE)
+
+# Trailing ":tag:tag:" on a heading.
+TAGS_RE = re.compile(r"[ \t]+(:(?:[A-Za-z0-9_@#%]+:)+)[ \t]*$")
+PRIORITY_RE = re.compile(r"^\[#([A-Za-z0-9])\][ \t]*")
+
+PLANNING_RE = re.compile(r"^[ \t]*(?:SCHEDULED|DEADLINE|CLOSED):", re.IGNORECASE)
+PROPERTIES_RE = re.compile(r"^([ \t]*):PROPERTIES:[ \t]*$", re.IGNORECASE)
+DRAWER_OPEN_RE = re.compile(r"^([ \t]*):([A-Za-z0-9_-]+):[ \t]*$")
+DRAWER_END_RE = re.compile(r"^[ \t]*:END:[ \t]*$", re.IGNORECASE)
+PROP_LINE_RE = re.compile(r"^([ \t]*):([^:\s]+?)(\+?):[ \t]*(.*?)[ \t]*$")
+
+TODO_DIRECTIVE_RE = re.compile(r"^#\+(SEQ_TODO|TYP_TODO|TODO):[ \t]*(.*)$", re.IGNORECASE)
+
+# Emacs writes properties as "%-10s %s" - keep the same shape so a drawer this
+# tool creates is indistinguishable from one Emacs created.
+PROP_KEY_WIDTH = 10
+
+# The command line as invoked, recorded on queued edits so `orgcli pending`
+# can show what an edit was. Set by main(); never used to replay.
+ARGV = []
+
+
+class OrgCliError(Exception):
+    code = EXIT_USAGE
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.message = message
+        if code is not None:
+            self.code = code
+
+
+class UsageError(OrgCliError):
+    code = EXIT_USAGE
+
+
+class NotFoundError(OrgCliError):
+    code = EXIT_NO_MATCH
+
+
+class PreconditionError(OrgCliError):
+    code = EXIT_PRECONDITION
+
+
+class AmbiguousError(OrgCliError):
+    code = EXIT_AMBIGUOUS
+
+    def __init__(self, message, candidates):
+        super().__init__(message)
+        self.candidates = candidates
+
+
+class StorageError(OrgCliError):
+    """The filesystem, not the request, is at fault - retry later.
+
+    Kept distinct from UsageError so an agent can tell "there is no such node"
+    (exit 1) and "you asked for something impossible" (exit 2) apart from "the
+    gdrive mount is down" (exit 5), which is the only one worth retrying.
+    """
+    code = EXIT_UNAVAILABLE
+
+
+def classify_oserror(exc, path=None):
+    """Turn an OSError into the right OrgCliError. Never returns None.
+
+    ENOENT is the awkward one: a mount that went away leaves the same errno as
+    a typo'd filename, and the two want opposite exit codes - 5 says retry, 2
+    says fix your command. Two independent tiebreakers, because the mirror is
+    off by default and so usually cannot help:
+
+      * The parent directory is missing. `~/gdrive/org-meta` only disappears
+        when the mount does; a mistyped *filename* still has its directory.
+      * We have read this exact path before, so it is not a typo. Only
+        available when ORGCLI_MIRROR=1.
+    """
+    err = getattr(exc, "errno", None)
+    if err in STORAGE_ERRNOS:
+        return StorageError("%s is unavailable: %s (errno %s)"
+                            % (path or "storage", exc.strerror or exc,
+                               errno.errorcode.get(err, err)))
+    if err == errno.ENOENT and path:
+        parent = os.path.dirname(os.path.abspath(path))
+        if not os.path.isdir(parent):
+            return StorageError(
+                "%s is unavailable: its directory %s does not exist either, "
+                "which usually means the mount went away rather than that the "
+                "path is wrong." % (path, parent))
+        if mirror_has(path):
+            return StorageError(
+                "%s has gone away: %s. It was readable before, so this is "
+                "most likely the mount, not a bad path."
+                % (path, exc.strerror or exc))
+    if err == errno.ENOENT:
+        return UsageError("no such file: %s" % (path or exc))
+    if err in (errno.EISDIR, errno.ENOTDIR):
+        return UsageError("not a file: %s" % (path or exc))
+    return UsageError("cannot access %s: %s" % (path or "file", exc))
+
+
+# ---------------------------------------------------------------------------
+# Line handling
+#
+# Lines are kept raw (with their terminator) so ''.join(lines) reproduces the
+# file byte for byte. We split on '\n' only - str.splitlines() would also break
+# on form feed, which Emacs uses as a page separator, and on U+2028, silently
+# shifting every line number away from what `wc -l` and `Grep` report.
+# ---------------------------------------------------------------------------
+
+
+def split_lines(text):
+    if text == "":
+        return []
+    parts = text.split("\n")
+    if parts[-1] == "":
+        parts.pop()
+        return [p + "\n" for p in parts]
+    return [p + "\n" for p in parts[:-1]] + [parts[-1]]
+
+
+def strip_eol(line):
+    if line.endswith("\n"):
+        line = line[:-1]
+    if line.endswith("\r"):
+        line = line[:-1]
+    return line
+
+
+def text_to_lines(text, nl="\n"):
+    """Turn a blob of user-supplied text into terminated org lines."""
+    if text == "":
+        return []
+    if text.endswith("\n"):
+        text = text[:-1]
+    return [strip_eol(p) + nl for p in text.split("\n")]
+
+
+def ensure_terminated(lines, nl="\n"):
+    """Every line but the last must end in a newline, or the file is corrupt."""
+    out = list(lines)
+    for i in range(len(out) - 1):
+        if not out[i].endswith("\n"):
+            out[i] = out[i] + nl
+    return out
+
+
+def norm(text):
+    """Comparison form for titles: case- and whitespace-insensitive."""
+    return " ".join(text.lower().split())
+
+
+# ---------------------------------------------------------------------------
+# Storage: the mount, the local mirror, and the pending-write queue
+#
+# The notes live on a fuse.rclone gdrive mount that dies periodically. Three
+# layers keep that from blocking an agent mid-session:
+#
+#   1. Every successful read is copied to ~/.cache/orgcli/mirror.
+#   2. When a read fails, it is served from the mirror and flagged stale.
+#   3. A write that cannot reach the mount - either because it failed, or
+#      because the doc it edited came from the mirror and might be behind the
+#      real file - is written to ~/.cache/orgcli/pending instead, with the
+#      sha of the content it was computed against. `orgcli sync` replays it
+#      once the mount is back, and refuses if that sha no longer matches.
+#
+# Nothing here changes behaviour when the mount is healthy: the mirror write
+# is skipped when the content is unchanged, and the queue is never touched.
+# ---------------------------------------------------------------------------
+
+
+def cache_dir():
+    return os.path.expanduser(os.environ.get("ORGCLI_CACHE_DIR", DEFAULT_CACHE_DIR))
+
+
+def mirror_dir():
+    return os.path.join(cache_dir(), "mirror")
+
+
+def pending_dir():
+    return os.path.join(cache_dir(), "pending")
+
+
+def sha_of(text):
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def cache_key(path):
+    """Filename-safe, collision-free stand-in for an absolute path."""
+    return hashlib.sha1(os.path.abspath(path).encode("utf-8")).hexdigest()[:16]
+
+
+def now_stamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def warn(message):
+    """Degraded-mode notices go to stderr so --json output stays parseable."""
+    sys.stderr.write("orgcli: %s\n" % message)
+
+
+def fault(kind):
+    """Test seam: ORGCLI_FAULT fakes a broken mount. Inert unless set.
+
+        read    reads fail                 write   writes fail
+        rename  only the final os.replace fails - the case the deleted
+                truncate-and-write fallback used to paper over
+        both    reads and writes fail      hang    everything blocks
+
+    This exists because none of the degraded paths can be exercised without
+    unmounting the developer's live gdrive, and it doubles as a way to
+    rehearse recovery by hand.
+    """
+    want = os.environ.get("ORGCLI_FAULT")
+    if not want:
+        return
+    if want == "hang":
+        time.sleep(3600)
+    if want == kind or want == "both":
+        raise OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+
+
+# -- raw file IO ------------------------------------------------------------
+
+
+def raw_read(path):
+    """Read from possibly-broken storage. Raises OSError; callers classify."""
+    fault("read")
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        return fh.read()
+
+
+def _replace(src, dst, faultable):
+    """os.replace, with the fault seam *inside* the call rather than before it.
+
+    That placement is deliberate: it means a future truncate-and-write
+    fallback wrapped around this call would catch the simulated error, and
+    tests/test_orgcli.py would notice.
+    """
+    if faultable:
+        fault("rename")
+    os.replace(src, dst)
+
+
+def _write_atomically(path, content, faultable=False):
+    """Temp file in the same directory, then os.replace.
+
+    There is deliberately no truncate-and-write fallback. An earlier version
+    had one, in case a FUSE mount ever rejected rename-over-existing - but on
+    a *flaky* mount that turns a cleanly failed write into a truncated org
+    file. Letting the error out is better: commit() turns it into a queued
+    edit, which loses nothing.
+    """
+    directory = os.path.dirname(path) or "."
+    mode = None
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        pass
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".orgcli-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(content)
+        if mode is not None:
+            os.chmod(tmp, mode)
+        _replace(tmp, path, faultable)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def atomic_write(path, content):
+    """Write an org file. May raise OSError if the mount is unhappy."""
+    fault("write")
+    _write_atomically(path, content, faultable=True)
+
+
+def local_write(path, content):
+    """Write inside the cache dir. Never fault-injected: the cache is on local
+    disk, and simulating gdrive being down must not simulate that failing too.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    _write_atomically(path, content)
+
+
+# -- mirror -----------------------------------------------------------------
+
+
+def mirror_paths(path):
+    base = os.path.join(mirror_dir(), cache_key(path))
+    return base + ".org", base + ".json"
+
+
+def mirror_has(path):
+    try:
+        return os.path.exists(mirror_paths(path)[0])
+    except OSError:
+        return False
+
+
+def mirror_get(path):
+    """(content, info) for the last good read of `path`, or None."""
+    body, meta = mirror_paths(path)
+    try:
+        with open(body, "r", encoding="utf-8", newline="") as fh:
+            content = fh.read()
+        with open(meta, "r", encoding="utf-8") as fh:
+            info = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return content, info
+
+
+def mirroring_enabled():
+    """Off unless ORGCLI_MIRROR=1.
+
+    Mirroring every read buys offline reads, at the cost of a second copy of
+    the notes on local disk that can be served in place of the real file
+    without being asked for. Opt in when you want the former; the queue below
+    works either way.
+    """
+    return os.environ.get("ORGCLI_MIRROR", "0") not in ("0", "", "no", "off")
+
+
+def mirror_put(path, content, force=False):
+    """Record a known-good state. Best effort: a cache problem must never
+    turn a working read or write into a failure.
+
+    `force` bypasses the ORGCLI_MIRROR setting. The queue uses it: chaining
+    one offline edit onto the next is the queue's own bookkeeping, not read
+    caching, and the mirror being off must not quietly make the queue unsound.
+    """
+    if not force and not mirroring_enabled():
+        return
+    digest = sha_of(content)
+    existing = mirror_get(path)
+    if existing and existing[1].get("sha") == digest:
+        return  # unchanged - re-reading a 24k-line file costs a hash, not a copy
+    body, meta = mirror_paths(path)
+    try:
+        local_write(body, content)
+        local_write(meta, json.dumps({
+            "path": os.path.abspath(path),
+            "sha": digest,
+            "size": len(content),
+            "read_at": now_stamp(),
+        }, indent=2) + "\n")
+    except OSError:
+        pass
+
+
+# -- pending-write queue ----------------------------------------------------
+
+
+def queue_entries(path=None):
+    """Queued edits, oldest first, optionally filtered to one file."""
+    try:
+        names = sorted(n for n in os.listdir(pending_dir()) if n.endswith(".json"))
+    except OSError:
+        return []
+    want = os.path.abspath(path) if path else None
+    out = []
+    for name in names:
+        meta = os.path.join(pending_dir(), name)
+        try:
+            with open(meta, "r", encoding="utf-8") as fh:
+                entry = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if want and entry.get("file") != want:
+            continue
+        entry["_meta"] = meta
+        entry["_body"] = meta[:-len(".json")] + ".content"
+        out.append(entry)
+    return out
+
+
+def queue_put(path, pre_sha, post_sha, content, reason):
+    """Park an edit for later. Stores the resulting content, not the command.
+
+    Replaying the content is byte-identical to re-running the command whenever
+    the pre_sha still matches - which is the only case sync ever applies - and
+    it sidesteps argv normalisation, consumed stdin and $ORGCLI_DIR drift.
+    The argv is recorded for `orgcli pending` to display, never for replay.
+    """
+    seq = 0
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    while True:
+        # <stamp>-<pid>-<seq> sorts lexically into creation order.
+        entry_id = "%s-%05d-%02d" % (stamp, os.getpid(), seq)
+        meta = os.path.join(pending_dir(), entry_id + ".json")
+        if not os.path.exists(meta):
+            break
+        seq += 1
+    local_write(meta[:-len(".json")] + ".content", content)
+    local_write(meta, json.dumps({
+        "id": entry_id,
+        "created": now_stamp(),
+        "file": os.path.abspath(path),
+        "argv": list(ARGV),
+        "pre_sha": pre_sha,
+        "post_sha": post_sha,
+        "reason": reason,
+    }, indent=2) + "\n")
+    return entry_id
+
+
+def queue_drop(entry):
+    for key in ("_body", "_meta"):
+        try:
+            os.remove(entry[key])
+        except OSError:
+            pass
+
+
+def queue_content(entry):
+    try:
+        with open(entry["_body"], "r", encoding="utf-8", newline="") as fh:
+            return fh.read()
+    except OSError as exc:
+        raise UsageError("queued edit %s has lost its content file (%s); "
+                         "drop it with: orgcli pending --drop %s"
+                         % (entry["id"], exc, entry["id"]))
+
+
+# -- timeout ----------------------------------------------------------------
+
+
+def timeout_seconds():
+    raw = os.environ.get("ORGCLI_TIMEOUT")
+    if raw is None:
+        return DEFAULT_TIMEOUT
+    try:
+        return max(0, float(raw))
+    except ValueError:
+        raise UsageError("ORGCLI_TIMEOUT must be a number of seconds, got %r" % raw)
+
+
+def _on_alarm(signum, frame):
+    raise StorageError(
+        "timed out after %gs waiting on the filesystem; the mount may be hung. "
+        "Raise or disable the limit with ORGCLI_TIMEOUT." % timeout_seconds())
+
+
+def arm_timeout(seconds=None):
+    """(Re)start the watchdog. Returns False if this platform has no SIGALRM.
+
+    Caveat worth knowing: a FUSE request in uninterruptible sleep will not
+    deliver the signal until the syscall returns, so this reliably catches a
+    *slow* mount and only sometimes catches a *wedged* one.
+    """
+    if not hasattr(signal, "SIGALRM"):
+        return False
+    if seconds is None:
+        seconds = timeout_seconds()
+    if not seconds:
+        return False
+    signal.signal(signal.SIGALRM, _on_alarm)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    return True
+
+
+def disarm_timeout():
+    if hasattr(signal, "SIGALRM"):
+        signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+# ---------------------------------------------------------------------------
+# Nodes
+# ---------------------------------------------------------------------------
+
+
+class Node:
+    __slots__ = (
+        "level", "start", "end", "todo", "priority", "title", "tags",
+        "commented", "parent", "children", "idx",
+    )
+
+    def __init__(self, level, start):
+        self.level = level
+        self.start = start          # index of the heading line
+        self.end = start + 1        # exclusive; end of the whole subtree
+        self.todo = None
+        self.priority = None
+        self.title = ""
+        self.tags = []
+        self.commented = False
+        self.parent = None
+        self.children = []
+        self.idx = -1
+
+    @property
+    def line(self):
+        """1-based line number of the heading."""
+        return self.start + 1
+
+    @property
+    def own_end(self):
+        """End of this node's own content, excluding descendant subtrees."""
+        return self.children[0].start if self.children else self.end
+
+    def ancestors(self):
+        out = []
+        n = self.parent
+        while n is not None:
+            out.append(n)
+            n = n.parent
+        out.reverse()
+        return out
+
+    def path(self):
+        return "/".join(escape_seg(n.title) for n in self.ancestors() + [self])
+
+
+def escape_seg(title):
+    return title.replace("\\", "\\\\").replace("/", "\\/")
+
+
+def split_path(spec):
+    """Split a --path on unescaped '/'. Backslash escapes '/' and itself."""
+    segs, cur, esc = [], [], False
+    for ch in spec:
+        if esc:
+            cur.append(ch)
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == "/":
+            segs.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if esc:
+        cur.append("\\")
+    segs.append("".join(cur))
+    segs = [s.strip() for s in segs]
+    return [s for s in segs if s != ""]
+
+
+# ---------------------------------------------------------------------------
+# Document
+# ---------------------------------------------------------------------------
+
+
+class OrgDoc:
+    def __init__(self, path, lines):
+        self.path = path
+        self.lines = lines
+        self.nl = "\n"
+        for ln in lines:
+            if ln.endswith("\r\n"):
+                self.nl = "\r\n"
+                break
+            if ln.endswith("\n"):
+                break
+        self.text = [strip_eol(ln) for ln in lines]
+        self.todo_keywords = []
+        self.done_keywords = []
+        self.nodes = []
+        self.roots = []
+        self._owner = None
+        # True when this content came from the local mirror because the real
+        # file was unreachable. Writes refuse to touch the mount in that state.
+        self.stale = False
+        self.mirror_read_at = None
+        self._parse()
+
+    # -- loading ----------------------------------------------------------
+
+    @classmethod
+    def load(cls, path, allow_mirror=True):
+        """Read `path`, falling back to the mirror when storage is down.
+
+        `allow_mirror=False` is for sync, which must compare against what is
+        actually on the mount and would be meaningless against a cached copy.
+        """
+        try:
+            raw = raw_read(path)
+        except OSError as exc:
+            err = classify_oserror(exc, path)
+            cached = mirror_get(path) if allow_mirror else None
+            if cached is None:
+                raise err
+            content, info = cached
+            doc = cls(path, split_lines(content))
+            doc.stale = True
+            doc.mirror_read_at = info.get("read_at")
+            warn("%s is unreachable (%s); serving the copy mirrored at %s. "
+                 "Writes will be queued, not applied."
+                 % (path, err.message, doc.mirror_read_at or "an unknown time"))
+            return doc
+        mirror_put(path, raw)
+        return cls(path, split_lines(raw))
+
+    def content(self):
+        return "".join(self.lines)
+
+    # -- parsing ----------------------------------------------------------
+
+    def _parse(self):
+        self._scan_keywords()
+        self._scan_headings()
+
+    def _scan_keywords(self):
+        """Collect #+TODO:/#+SEQ_TODO:/#+TYP_TODO: declarations.
+
+        Several files declare more than one line (daily.org has two), so the
+        sets accumulate. '|' separates not-done from done states; with no '|'
+        org treats the last keyword as the done state.
+        """
+        todo, done = [], []
+        for text in self.text:
+            m = TODO_DIRECTIVE_RE.match(text)
+            if not m:
+                continue
+            spec = m.group(2)
+            before, sep, after = spec.partition("|")
+            pre = [strip_fast_key(w) for w in before.split()]
+            post = [strip_fast_key(w) for w in after.split()]
+            if not sep and pre:
+                post = [pre.pop()]
+            todo.extend(w for w in pre if w)
+            done.extend(w for w in post if w)
+        if not todo and not done:
+            todo, done = list(DEFAULT_TODO), list(DEFAULT_DONE)
+        self.todo_keywords = dedupe(todo)
+        self.done_keywords = dedupe(done)
+
+    @property
+    def all_keywords(self):
+        return self.todo_keywords + self.done_keywords
+
+    def _scan_headings(self):
+        """One pass for headings, suppressing detection inside blocks.
+
+        tools.org alone has 270 #+begin_src blocks and shell snippets inside
+        them start lines with '*' often enough to matter. Org's own escape for
+        a literal '*' at column 0 in a body is a leading comma (',*'), which
+        HEADING_RE cannot match anyway - noted here so nobody "simplifies" the
+        regex into one that can.
+        """
+        block = None
+        stack = []
+        for i, text in enumerate(self.text):
+            if block is None:
+                m = BEGIN_RE.match(text)
+                if m:
+                    block = m.group(1).lower()
+                    continue
+            else:
+                m = END_RE.match(text)
+                # Only a matching #+end_ closes the block, so a stray one in
+                # prose cannot desync the rest of the file.
+                if m and m.group(1).lower() == block:
+                    block = None
+                continue
+
+            m = HEADING_RE.match(text)
+            if not m:
+                continue
+            node = Node(len(m.group(1)), i)
+            parse_heading(node, m.group(2), self.all_keywords)
+            while stack and stack[-1].level >= node.level:
+                stack.pop().end = i
+            if stack:
+                node.parent = stack[-1]
+                stack[-1].children.append(node)
+            else:
+                self.roots.append(node)
+            node.idx = len(self.nodes)
+            self.nodes.append(node)
+            stack.append(node)
+
+        for node in stack:
+            node.end = len(self.lines)
+        # An unterminated block leaves every following heading unseen; loud
+        # enough to matter, quiet enough not to block a read.
+        if block is not None:
+            warn("unterminated #+begin_%s in %s; headings after it were not "
+                 "parsed" % (block, self.path))
+
+    # -- zones ------------------------------------------------------------
+
+    def planning_end(self, node):
+        """First line after the heading's planning lines."""
+        i = node.start + 1
+        limit = node.own_end
+        while i < limit and PLANNING_RE.match(self.text[i]):
+            i += 1
+        return i
+
+    def drawer_span(self, node):
+        """(start, end) of the :PROPERTIES: drawer, or None.
+
+        Org requires the drawer immediately after the heading and its planning
+        line, and so do we - a ':PROPERTIES:' further down is body content.
+        """
+        i = self.planning_end(node)
+        if i >= node.own_end or not PROPERTIES_RE.match(self.text[i]):
+            return None
+        j = i + 1
+        while j < node.own_end:
+            if DRAWER_END_RE.match(self.text[j]):
+                return (i, j + 1)
+            j += 1
+        return None  # unterminated drawer: treat as body, do not guess
+
+    def body_start(self, node):
+        span = self.drawer_span(node)
+        return span[1] if span else self.planning_end(node)
+
+    def properties(self, node):
+        span = self.drawer_span(node)
+        if not span:
+            return {}
+        props = {}
+        for i in range(span[0] + 1, span[1] - 1):
+            m = PROP_LINE_RE.match(self.text[i])
+            if not m:
+                continue
+            key, plus, value = m.group(2), m.group(3), m.group(4)
+            if plus and key in props:
+                props[key] = (props[key] + " " + value).strip()
+            else:
+                props[key] = value
+        return props
+
+    def prop(self, node, key):
+        return self.properties(node).get(key)
+
+    # -- descriptions -----------------------------------------------------
+
+    def description(self, node):
+        """:DESCRIPTION: property, else a '** description' child, else None.
+
+        The child form is what tools.org uses for ~30 of its level-1 nodes; it
+        stays readable so nothing has to be migrated before this tool is
+        useful. Writes always go to the property.
+        """
+        value = self.prop(node, "DESCRIPTION")
+        if value:
+            return value
+        child = self.description_child(node)
+        if child is not None:
+            return self.flatten(child)
+        return None
+
+    def description_child(self, node):
+        for child in node.children:
+            if norm(child.title) == "description":
+                return child
+        return None
+
+    def flatten(self, node):
+        """Collapse a node's body to one line, the way cfnote's indexer did."""
+        body = self.text[self.body_start(node):node.end]
+        return " ".join(" ".join(body).split())
+
+    # -- lookup -----------------------------------------------------------
+
+    def owner_of(self, index):
+        """Deepest node whose span contains this line index, or None."""
+        if self._owner is None:
+            owner = [None] * len(self.lines)
+            # Document order means a child is always assigned after its parent
+            # and so wins for the lines they share.
+            for node in self.nodes:
+                for i in range(node.start, node.end):
+                    owner[i] = node
+            self._owner = owner
+        return self._owner[index]
+
+    def find_by_line(self, line):
+        for node in self.nodes:
+            if node.line == line:
+                return node
+        raise NotFoundError("no heading starts at line %d in %s" % (line, self.path))
+
+    def find_by_id(self, node_id):
+        want = node_id.strip().lower()
+        hits = [n for n in self.nodes if (self.prop(n, "ID") or "").lower() == want]
+        if not hits:
+            raise NotFoundError("no node with :ID: %s in %s" % (node_id, self.path))
+        if len(hits) > 1:
+            raise AmbiguousError("duplicate :ID: %s" % node_id, hits)
+        return hits[0]
+
+    def find_by_path(self, spec, strict_root=False):
+        hits = self._path_hits(split_path(spec), strict_root)
+        if not hits and "/" in spec:
+            # 8 of tools.org's 120 level-1 titles contain a literal slash
+            # ("ssh / sush", "lldb / gdb", "misc tools/services"), and an agent
+            # copying a title out of the index has no reason to know it needs
+            # escaping. If the segmented reading finds nothing, try the whole
+            # spec as one title. Segmented always wins when it matches, so this
+            # can never reinterpret a working path.
+            hits = self._path_hits([spec.replace("\\/", "/")], strict_root)
+        if not hits:
+            raise NotFoundError(
+                'no node matching path "%s" in %s%s'
+                % (spec, self.path,
+                   "" if "/" in spec else
+                   " (paths are parent/child; try `orgcli search` if you are "
+                   "guessing at the title)"))
+        if len(hits) > 1:
+            # Prefer a single shallowest match: 'acl' should not be ambiguous
+            # just because some deeper node is also called 'acl'.
+            best = min(n.level for n in hits)
+            shallow = [n for n in hits if n.level == best]
+            if len(shallow) == 1:
+                return shallow[0]
+            raise AmbiguousError('path "%s" matches %d nodes' % (spec, len(hits)), hits)
+        return hits[0]
+
+    def _path_hits(self, segs, strict_root):
+        if not segs:
+            raise UsageError("empty --path")
+        want = [norm(s) for s in segs]
+        hits = []
+        for node in self.nodes:
+            top = self._match_chain(node, want)
+            if top is None:
+                continue
+            if strict_root and top.parent is not None:
+                continue
+            hits.append(node)
+        return hits
+
+    def _match_chain(self, node, want):
+        """Does `node` end a contiguous ancestor chain matching `want`?
+
+        Returns the topmost matched node, or None.
+        """
+        cur = node
+        for seg in reversed(want):
+            if cur is None or norm(cur.title) != seg:
+                return None
+            top = cur
+            cur = cur.parent
+        return top
+
+    def resolve(self, args, required=True):
+        given = [x for x in (args.path, args.id, args.line) if x is not None]
+        if len(given) > 1:
+            raise UsageError("give only one of --path, --id, --line")
+        if not given:
+            if required:
+                raise UsageError("one of --path, --id, --line is required")
+            return None
+        if args.path is not None:
+            return self.find_by_path(args.path, getattr(args, "strict_root", False))
+        if args.id is not None:
+            return self.find_by_id(args.id)
+        return self.find_by_line(args.line)
+
+    # -- hashing ----------------------------------------------------------
+
+    def subtree_text(self, node):
+        return "".join(self.lines[node.start:node.end])
+
+    def hash(self, node):
+        digest = hashlib.sha1(self.subtree_text(node).encode("utf-8"))
+        return digest.hexdigest()[:HASH_LEN]
+
+
+def dedupe(seq):
+    seen, out = set(), []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def strip_fast_key(word):
+    """'PROG(p)' -> 'PROG', 'CANCELLED(c@/!)' -> 'CANCELLED'."""
+    return word.split("(", 1)[0].strip()
+
+
+def parse_heading(node, rest, keywords):
+    """Decompose '[KW] [COMMENT] [#A] title :tag:tag:'."""
+    m = TAGS_RE.search(rest)
+    if m:
+        node.tags = [t for t in m.group(1).split(":") if t]
+        rest = rest[:m.start()]
+    rest = rest.strip()
+    for kw in keywords:
+        if rest == kw or rest.startswith(kw + " "):
+            node.todo = kw
+            rest = rest[len(kw):].strip()
+            break
+    if rest == "COMMENT" or rest.startswith("COMMENT "):
+        node.commented = True
+        rest = rest[len("COMMENT"):].strip()
+    m = PRIORITY_RE.match(rest)
+    if m:
+        node.priority = m.group(1)
+        rest = rest[m.end():].strip()
+    node.title = rest
+
+
+def render_heading(node, nl="\n"):
+    parts = ["*" * node.level]
+    if node.todo:
+        parts.append(node.todo)
+    if node.commented:
+        parts.append("COMMENT")
+    if node.priority:
+        parts.append("[#%s]" % node.priority)
+    if node.title:
+        parts.append(node.title)
+    line = " ".join(parts)
+    if node.tags:
+        line += " :" + ":".join(node.tags) + ":"
+    return line + nl
+
+
+def warn(message):
+    sys.stderr.write("orgcli: warning: %s\n" % message)
+
+
+# ---------------------------------------------------------------------------
+# File resolution
+# ---------------------------------------------------------------------------
+
+
+def org_dir():
+    return os.path.expanduser(os.environ.get("ORGCLI_DIR", DEFAULT_ORG_DIR))
+
+
+def resolve_file(spec):
+    """'tools' -> $ORGCLI_DIR/tools.org; anything path-like is used as given."""
+    if spec is None:
+        spec = os.environ.get("ORGCLI_FILE")
+    if not spec:
+        raise UsageError(
+            "no file given: pass --file, or set ORGCLI_FILE. A bare name like "
+            "'tools' resolves to %s/tools.org" % org_dir())
+    spec = os.path.expanduser(spec)
+    if os.sep in spec or spec.startswith(".") or spec.endswith(".org"):
+        return os.path.abspath(spec)
+    return os.path.join(org_dir(), spec + ".org")
+
+
+def load(args):
+    return OrgDoc.load(resolve_file(args.file))
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+
+def section(name, body=None):
+    sys.stdout.write("---%s---\n" % name)
+    if body is None:
+        return
+    if not body.endswith("\n"):
+        body += "\n"
+    sys.stdout.write(body)
+
+
+def emit_json(payload):
+    sys.stdout.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def human_size(n):
+    if n < 1024:
+        return "%dB" % n
+    if n < 1024 * 1024:
+        return "%.1fK" % (n / 1024.0)
+    return "%.1fM" % (n / (1024.0 * 1024))
+
+
+def node_label(doc, node, stats=False, desc=False):
+    """One line describing a node, used by outline and candidate listings."""
+    label = node.title or "(untitled)"
+    if node.todo:
+        label = "%s %s" % (node.todo, label)
+    if node.priority:
+        label = "[#%s] %s" % (node.priority, label)
+    if node.tags:
+        label += "  :" + ":".join(node.tags) + ":"
+    if stats:
+        nlines = node.end - node.start
+        nbytes = len(doc.subtree_text(node).encode("utf-8"))
+        label += "  (%dL %s)" % (nlines, human_size(nbytes))
+    if desc:
+        text = doc.description(node)
+        if text:
+            label += "  :: " + text
+    return label
+
+
+def node_dict(doc, node, include_body=False):
+    payload = {
+        "path": node.path(),
+        "title": node.title,
+        "level": node.level,
+        "start": node.line,
+        "end": node.end,
+        "lines": node.end - node.start,
+        "hash": doc.hash(node),
+        "todo": node.todo,
+        "tags": node.tags,
+        "priority": node.priority,
+        "id": doc.prop(node, "ID"),
+        "description": doc.description(node),
+    }
+    if include_body:
+        payload["body"] = "".join(doc.lines[doc.body_start(node):node.own_end])
+        payload["text"] = doc.subtree_text(node)
+    return payload
+
+
+def node_summary(doc, node):
+    bits = [
+        "path=%s" % node.path(),
+        "level=%d" % node.level,
+        "lines=%d-%d" % (node.line, node.end),
+        "hash=%s" % doc.hash(node),
+    ]
+    node_id = doc.prop(node, "ID")
+    if node_id:
+        bits.append("id=%s" % node_id)
+    if node.todo:
+        bits.append("todo=%s" % node.todo)
+    if node.tags:
+        bits.append("tags=%s" % ":".join(node.tags))
+    return "  ".join(bits)
+
+
+def print_candidates(doc, candidates):
+    section("CANDIDATES")
+    for node in candidates:
+        sys.stdout.write("%6d\t%s\n" % (node.line, node.path()))
+
+
+# ---------------------------------------------------------------------------
+# Writing
+# ---------------------------------------------------------------------------
+
+
+def backup_dir():
+    return os.path.expanduser(os.environ.get("ORGCLI_BACKUP_DIR", DEFAULT_BACKUP_DIR))
+
+
+def make_backup(path, content=None):
+    """Snapshot `path` to local disk before overwriting it.
+
+    `content` short-circuits the re-read when the caller already has the bytes,
+    which matters on a slow mount and avoids a second chance to fail.
+    """
+    directory = backup_dir()
+    os.makedirs(directory, exist_ok=True)
+    base = os.path.basename(path)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(directory, "%s.%s-%d" % (base, stamp, os.getpid()))
+    if content is None:
+        shutil.copy2(path, dest)
+    else:
+        with open(dest, "w", encoding="utf-8", newline="") as fh:
+            fh.write(content)
+    prune_backups(directory, base)
+    return dest
+
+
+def prune_backups(directory, base):
+    prefix = base + "."
+    try:
+        names = [n for n in os.listdir(directory) if n.startswith(prefix)]
+    except OSError:
+        return
+    if len(names) <= BACKUP_KEEP:
+        return
+    names.sort()
+    for name in names[:-BACKUP_KEEP]:
+        try:
+            os.remove(os.path.join(directory, name))
+        except OSError:
+            pass
+
+
+def diff_text(old, new, path):
+    return "".join(difflib.unified_diff(
+        split_lines(old), split_lines(new),
+        fromfile=path, tofile=path + " (new)", n=3))
+
+
+def report(args, status, path, extra=None, **fields):
+    """Emit a write result as ---SECTION--- blocks, or as JSON with --json.
+
+    Commands that both read and write (id, describe) register --json, so a
+    write has to honour it too rather than silently falling back to sections.
+    """
+    if getattr(args, "json", False):
+        payload = {"file": path, "status": status}
+        payload.update({k: v for k, v in fields.items() if v is not None})
+        for name, body in extra or []:
+            if body is not None:
+                payload[name.lower()] = body.rstrip("\n") if name != "DIFF" else body
+        emit_json(payload)
+        return EXIT_OK
+    section("FILE", path)
+    bits = ["status=%s" % status]
+    for key in ("backup", "lines", "hash", "queued", "reason"):
+        if fields.get(key) is not None:
+            bits.append("%s=%s" % (key, fields[key]))
+    section("RESULT", "  ".join(bits))
+    for name, body in extra or []:
+        section(name, body)
+    return EXIT_OK
+
+
+def enqueue(doc, args, old_content, new_content, reason, extra=None):
+    """Park an edit that could not reach the mount, and update the mirror.
+
+    Reports exit 0 with status=queued: the edit is durably recorded on local
+    disk, so the caller has not lost work. It has *not* reached gdrive, which
+    is why the status string says so rather than saying "written".
+    """
+    if os.environ.get("ORGCLI_NO_QUEUE") == "1":
+        raise StorageError(
+            "cannot write %s (%s) and ORGCLI_NO_QUEUE=1 is set, so the edit "
+            "was discarded" % (doc.path, reason))
+
+    # Every queued edit for a file must start from where the previous one
+    # ended, or replaying them in order is not equivalent to having run the
+    # commands in order. Queueing an edit built on a stale base would look
+    # fine here and fail at sync time, after the chance to do something about
+    # it has passed - so refuse now, while the content is still in hand.
+    old_sha = sha_of(old_content)
+    queued = queue_entries(doc.path)
+    if queued and queued[-1]["post_sha"] != old_sha:
+        raise PreconditionError(
+            "%s already has %d queued edit(s), and this one was computed "
+            "against a different version of the file (%s, not %s). Queueing "
+            "it would silently revert them, so it has been dropped - the "
+            "queue is untouched. Flush it with `orgcli sync` once storage is "
+            "back, then redo this edit; `orgcli pending -f %s` shows what is "
+            "waiting. (Set ORGCLI_MIRROR=1 to let edits stack while the mount "
+            "is down.)"
+            % (doc.path, len(queued), old_sha[:HASH_LEN],
+               queued[-1]["post_sha"][:HASH_LEN], doc.path))
+
+    entry_id = queue_put(doc.path, old_sha, sha_of(new_content),
+                         new_content, reason)
+    # Chain point: the mirror now holds the post-edit content, so a further
+    # offline edit is computed against it and its pre_sha lines up with this
+    # entry's post_sha. Forced past ORGCLI_MIRROR=0 - see mirror_put.
+    mirror_put(doc.path, new_content, force=True)
+    warn("queued edit %s for %s (%s). It is NOT on gdrive yet; it will be "
+         "applied by the next write to this file, or by: orgcli sync"
+         % (entry_id, doc.path, reason))
+    return report(args, "queued", doc.path, extra, queued=entry_id, reason=reason)
+
+
+def commit(doc, args, new_lines, changed_node=None, extra=None):
+    """Shared tail of every write command: guard, diff-or-write, report."""
+    new_lines = ensure_terminated(new_lines, doc.nl)
+    # A file that ended without a newline keeps ending without one, so an edit
+    # elsewhere in the file does not show up as a spurious last-line hunk in
+    # git or hg.
+    if doc.lines and not doc.lines[-1].endswith("\n") and new_lines:
+        new_lines[-1] = strip_eol(new_lines[-1])
+    new_content = "".join(new_lines)
+    old_content = doc.content()
+
+    if new_content == old_content:
+        return report(args, "unchanged", doc.path, extra)
+
+    if getattr(args, "dry_run", False):
+        # --dry-run never queues: it is the one mode that promises to leave
+        # every kind of state exactly as it found it.
+        diff = diff_text(old_content, new_content, doc.path)
+        return report(args, "dry-run", doc.path,
+                      (extra or []) + [("DIFF", diff)])
+
+    if doc.stale:
+        # This edit was computed against the mirror, which may be behind the
+        # real file. Writing it to a recovered mount would clobber whatever
+        # landed there in the meantime, so queue unconditionally and let sync
+        # check the hash later.
+        return enqueue(doc, args, old_content, new_content,
+                       "read from mirror; mount was unreachable", extra)
+
+    try:
+        # Preflight: fail before taking a backup and before touching the file,
+        # so a dead mount cannot leave us half-way through a write.
+        os.stat(doc.path)
+        backup = None
+        if not getattr(args, "no_backup", False):
+            backup = make_backup(doc.path, old_content)
+        atomic_write(doc.path, new_content)
+    except OSError as exc:
+        err = classify_oserror(exc, doc.path)
+        if not isinstance(err, StorageError):
+            raise err
+        return enqueue(doc, args, old_content, new_content, err.message, extra)
+
+    mirror_put(doc.path, new_content)
+
+    lines = node_hash = None
+    if changed_node is not None:
+        fresh = OrgDoc(doc.path, new_lines)
+        try:
+            node = fresh.find_by_line(changed_node)
+            lines = "%d-%d" % (node.line, node.end)
+            node_hash = fresh.hash(node)
+        except OrgCliError:
+            pass
+    return report(args, "written", doc.path, extra,
+                  backup=backup, lines=lines, hash=node_hash)
+
+
+def check_if_match(doc, node, args):
+    want = getattr(args, "if_match", None)
+    if not want:
+        return
+    have = doc.hash(node)
+    if want != have:
+        raise PreconditionError(
+            "--if-match %s but node is now %s; re-read it before writing"
+            % (want, have))
+
+
+# ---------------------------------------------------------------------------
+# Property drawer editing
+#
+# Returns a fresh line list. Callers re-parse rather than patching offsets.
+# ---------------------------------------------------------------------------
+
+
+def format_prop(key, value, indent=""):
+    label = ":%s:" % key
+    return "%s%s %s" % (indent, label.ljust(PROP_KEY_WIDTH), value)
+
+
+def set_properties(doc, node, updates):
+    """updates: {KEY: value or None to unset}. Returns new lines."""
+    lines = list(doc.lines)
+    span = doc.drawer_span(node)
+    nl = doc.nl
+
+    if span is None:
+        wanted = [(k, v) for k, v in updates.items() if v is not None]
+        if not wanted:
+            return lines
+        insert_at = doc.planning_end(node)
+        block = [":PROPERTIES:" + nl]
+        block += [format_prop(k, v) + nl for k, v in wanted]
+        block += [":END:" + nl]
+        return lines[:insert_at] + block + lines[insert_at:]
+
+    start, end = span
+    m = PROPERTIES_RE.match(doc.text[start])
+    indent = m.group(1) if m else ""
+    body = []
+    seen = set()
+    for i in range(start + 1, end - 1):
+        pm = PROP_LINE_RE.match(doc.text[i])
+        key = pm.group(2) if pm else None
+        if key is not None and key in updates:
+            if key in seen:
+                continue  # collapse duplicates / :KEY+: continuations
+            seen.add(key)
+            value = updates[key]
+            if value is not None:
+                body.append(format_prop(key, value, indent) + nl)
+            continue
+        body.append(lines[i])
+    for key, value in updates.items():
+        if value is not None and key not in seen:
+            body.append(format_prop(key, value, indent) + nl)
+
+    if not body:
+        # Last property removed: drop the whole drawer rather than leave an
+        # empty one, which org renders as noise.
+        return lines[:start] + lines[end:]
+    block = [lines[start]] + body + [lines[end - 1]]
+    return lines[:start] + block + lines[end:]
+
+
+def ensure_id(doc, node, lines=None):
+    """Return (lines, id). Mints a UUID only if the node has none."""
+    existing = doc.prop(node, "ID")
+    if existing:
+        return (list(doc.lines) if lines is None else lines), existing
+    new_id = str(uuid.uuid4())
+    return set_properties(doc, node, {"ID": new_id}), new_id
+
+
+# ---------------------------------------------------------------------------
+# Text input
+# ---------------------------------------------------------------------------
+
+
+def read_text(args, required=True):
+    """Body text from --text, --text-file, or stdin.
+
+    Agents should prefer stdin/heredoc: it sidesteps shell quoting around org's
+    '*' and '=', which is the usual way a hand-built command corrupts a note.
+    """
+    if getattr(args, "text", None) is not None:
+        return args.text
+    spec = getattr(args, "text_file", None)
+    if spec == "-":
+        return sys.stdin.read()
+    if spec:
+        try:
+            with open(os.path.expanduser(spec), "r", encoding="utf-8") as fh:
+                return fh.read()
+        except OSError as exc:
+            raise UsageError("cannot read --text-file: %s" % exc)
+    if not required:
+        # Body text is optional here (`add` with no body). Never fall through
+        # to a bare stdin read: in a pipeline stdin is inherited and may never
+        # close, so the command would hang instead of creating an empty node.
+        # Ask for stdin explicitly with --text-file - if you want it.
+        return None
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    raise UsageError("no text given: use --text, --text-file, or pipe stdin")
+
+
+def begin_write(args):
+    """Resolve the target, enforce --if-match, honour --ensure-id."""
+    doc = load(args)
+    node = doc.resolve(args)
+    check_if_match(doc, node, args)
+    if getattr(args, "ensure_id", False):
+        lines, _ = ensure_id(doc, node)
+        doc = OrgDoc(doc.path, ensure_terminated(lines, doc.nl))
+        # Inserting a drawer never moves the heading line itself.
+        node = doc.find_by_line(node.line)
+    return doc, node
+
+
+# ---------------------------------------------------------------------------
+# Read commands
+# ---------------------------------------------------------------------------
+
+
+def in_scope(node, root):
+    if root is None:
+        return True
+    return node is root or root in node.ancestors()
+
+
+def rel_depth(node, root):
+    return node.level if root is None else node.level - root.level + 1
+
+
+def cmd_outline(args):
+    doc = load(args)
+    root = doc.resolve(args, required=False)
+    rows = []
+    for node in doc.nodes:
+        if not in_scope(node, root):
+            continue
+        if args.depth is not None and rel_depth(node, root) > args.depth:
+            continue
+        if args.todo is not None:
+            if not node.todo:
+                continue
+            if args.todo != "*" and node.todo.upper() != args.todo.upper():
+                continue
+        if args.tag and args.tag not in node.tags:
+            continue
+        rows.append(node)
+
+    if args.json:
+        emit_json({
+            "file": doc.path,
+            "count": len(rows),
+            "nodes": [node_dict(doc, n) for n in rows],
+        })
+        return EXIT_OK
+
+    section("FILE", doc.path)
+    section("OUTLINE")
+    for node in rows:
+        indent = "  " * (rel_depth(node, root) - 1)
+        sys.stdout.write("%6d  %s%s\n" % (
+            node.line, indent, node_label(doc, node, args.stats, args.desc)))
+    section("SUMMARY", "nodes=%d" % len(rows))
+    return EXIT_OK
+
+
+def collect_ranges(doc, node, depth):
+    """Line ranges for a node shown to a relative depth (None = whole subtree)."""
+    if depth is None:
+        return [(node.start, node.end)]
+    ranges = [(node.start, node.own_end)]
+    if depth > 1:
+        for child in node.children:
+            ranges.extend(collect_ranges(doc, child, depth - 1))
+    return ranges
+
+
+def cmd_show(args):
+    doc = load(args)
+    node = doc.resolve(args)
+
+    if args.headings_only:
+        body = "".join(
+            "%6d  %s%s\n" % (n.line, "  " * (n.level - node.level),
+                             node_label(doc, n))
+            for n in doc.nodes
+            if in_scope(n, node))
+    elif args.body_only:
+        body = "".join(doc.lines[doc.body_start(node):node.own_end])
+    else:
+        out = []
+        for start, end in collect_ranges(doc, node, args.depth):
+            out.extend(doc.lines[start:end])
+        body = "".join(out)
+
+    truncated = 0
+    if args.max_lines is not None:
+        kept = split_lines(body)
+        if len(kept) > args.max_lines:
+            truncated = len(kept) - args.max_lines
+            body = "".join(kept[:args.max_lines])
+
+    if args.json:
+        payload = node_dict(doc, node, include_body=True)
+        payload["file"] = doc.path
+        payload["shown"] = body
+        payload["truncated"] = truncated
+        emit_json(payload)
+        return EXIT_OK
+
+    section("FILE", doc.path)
+    section("NODE", node_summary(doc, node))
+    section("BODY", body)
+    if truncated:
+        section("SUMMARY", "truncated=%d lines; re-run without --max-lines "
+                           "or narrow with --depth" % truncated)
+    return EXIT_OK
+
+
+def cmd_search(args):
+    doc = load(args)
+    root = doc.resolve(args, required=False)
+    flags = re.IGNORECASE if args.ignore_case else 0
+    pattern = re.escape(args.pattern) if args.fixed else args.pattern
+    try:
+        rx = re.compile(pattern, flags)
+    except re.error as exc:
+        raise UsageError("bad pattern: %s" % exc)
+
+    where = args.where
+    hits = []
+    for i, text in enumerate(doc.text):
+        node = doc.owner_of(i)
+        if root is not None and (node is None or not in_scope(node, root)):
+            continue
+        is_heading = node is not None and node.start == i
+        if is_heading and where == "body":
+            continue
+        if not is_heading and where == "heading":
+            continue
+        if not rx.search(text):
+            continue
+        hits.append((i, node, "heading" if is_heading else "body"))
+        if len(hits) >= args.limit:
+            break
+
+    if args.json:
+        emit_json({
+            "file": doc.path,
+            "count": len(hits),
+            "truncated": len(hits) >= args.limit,
+            "matches": [{
+                "line": i + 1,
+                "where": kind,
+                "path": n.path() if n else "",
+                "text": doc.text[i],
+                "context": doc.text[max(0, i - args.context):i + args.context + 1]
+                           if args.context else [],
+            } for i, n, kind in hits],
+        })
+        return EXIT_OK
+
+    section("FILE", doc.path)
+    section("MATCHES")
+    for i, node, kind in hits:
+        sys.stdout.write("%6d  %s  [%s]\n" % (
+            i + 1, node.path() if node else "(preamble)", kind))
+        lo = max(0, i - args.context)
+        hi = min(len(doc.text), i + args.context + 1)
+        for j in range(lo, hi):
+            marker = ">" if j == i else " "
+            sys.stdout.write("        %s %s\n" % (marker, doc.text[j]))
+    section("SUMMARY", "matches=%d%s" % (
+        len(hits), "  truncated=yes" if len(hits) >= args.limit else ""))
+    return EXIT_OK if hits else EXIT_NO_MATCH
+
+
+def cmd_path(args):
+    doc = load(args)
+    # `path` is the bridge from a grep hit back to an address, and a grep hit is
+    # almost never a heading line, so --line here resolves to the node that
+    # *contains* the line. Every other command keeps the strict reading: you do
+    # not want `delete --line 13` removing the enclosing node because line 13
+    # happened to be a bullet inside it.
+    match = "exact"
+    if args.line is not None and args.path is None and args.id is None:
+        if not 1 <= args.line <= len(doc.lines):
+            raise UsageError("line %d is outside %s (%d lines)"
+                             % (args.line, doc.path, len(doc.lines)))
+        node = next((n for n in doc.nodes if n.line == args.line), None)
+        if node is None:
+            node = doc.owner_of(args.line - 1)
+            match = "containing"
+            if node is None:
+                raise NotFoundError(
+                    "line %d is in the preamble, above the first heading of %s"
+                    % (args.line, doc.path))
+    else:
+        node = doc.resolve(args)
+
+    chain = node.ancestors() + [node]
+    if args.json:
+        payload = node_dict(doc, node)
+        payload["file"] = doc.path
+        payload["match"] = match
+        payload["chain"] = [{"line": n.line, "level": n.level, "title": n.title}
+                            for n in chain]
+        emit_json(payload)
+        return EXIT_OK
+    section("FILE", doc.path)
+    section("PATH", node.path())
+    section("CHAIN")
+    for n in chain:
+        sys.stdout.write("%6d  %s%s\n" % (n.line, "  " * (n.level - 1), n.title))
+    section("NODE", node_summary(doc, node))
+    if match == "containing":
+        section("SUMMARY", "match=containing (line %d is inside this node, not "
+                           "its heading)" % args.line)
+    return EXIT_OK
+
+
+def cmd_props(args):
+    doc = load(args)
+    node = doc.resolve(args)
+    props = doc.properties(node)
+    if args.json:
+        emit_json({"file": doc.path, "path": node.path(), "properties": props})
+        return EXIT_OK
+    section("FILE", doc.path)
+    section("NODE", node_summary(doc, node))
+    section("PROPERTIES")
+    for key in sorted(props):
+        sys.stdout.write("%s=%s\n" % (key, props[key]))
+    return EXIT_OK
+
+
+def cmd_id(args):
+    doc = load(args)
+    node = doc.resolve(args)
+    if not args.ensure:
+        existing = doc.prop(node, "ID")
+        if args.json:
+            emit_json({"file": doc.path, "path": node.path(), "id": existing})
+            return EXIT_OK
+        section("FILE", doc.path)
+        section("ID", existing or "")
+        return EXIT_OK if existing else EXIT_NO_MATCH
+    check_if_match(doc, node, args)
+    existing = doc.prop(node, "ID")
+    if existing:
+        section("FILE", doc.path)
+        section("ID", existing)
+        section("RESULT", "status=unchanged")
+        return EXIT_OK
+    lines, new_id = ensure_id(doc, node)
+    return commit(doc, args, lines, node.line, extra=[("ID", new_id)])
+
+
+def cmd_describe(args):
+    doc = load(args)
+
+    if args.missing:
+        root = doc.resolve(args, required=False)
+        rows = []
+        for node in doc.nodes:
+            if not in_scope(node, root):
+                continue
+            if args.depth is not None and rel_depth(node, root) > args.depth:
+                continue
+            if doc.description(node):
+                continue
+            rows.append(node)
+        if args.json:
+            emit_json({"file": doc.path, "count": len(rows),
+                       "nodes": [node_dict(doc, n) for n in rows]})
+            return EXIT_OK
+        section("FILE", doc.path)
+        section("MISSING")
+        for node in rows:
+            preview = ""
+            for text in doc.text[doc.body_start(node):node.own_end]:
+                if text.strip():
+                    preview = text.strip()[:70]
+                    break
+            sys.stdout.write("%6d  %-50s  %s\n" % (
+                node.line, node.path()[:50], preview))
+        section("SUMMARY", "missing=%d" % len(rows))
+        return EXIT_OK
+
+    node = doc.resolve(args)
+
+    if args.clear:
+        check_if_match(doc, node, args)
+        if doc.description_child(node) is not None:
+            warn("cleared the :DESCRIPTION: property, but a '** description' "
+                 "child remains and will still be used as the description")
+        return commit(doc, args, set_properties(doc, node, {"DESCRIPTION": None}),
+                      node.line)
+
+    if args.text is not None or args.text_file is not None:
+        text = " ".join(read_text(args).split())
+        if not text:
+            raise UsageError("empty description; use --clear to remove one")
+        doc, node = begin_write(args)
+        return commit(doc, args, set_properties(doc, node, {"DESCRIPTION": text}),
+                      node.line)
+
+    value = doc.description(node)
+    source = "property" if doc.prop(node, "DESCRIPTION") else (
+        "child" if doc.description_child(node) else "none")
+    if args.json:
+        emit_json({"file": doc.path, "path": node.path(),
+                   "description": value, "source": source})
+        return EXIT_OK
+    section("FILE", doc.path)
+    section("NODE", node_summary(doc, node))
+    section("DESCRIPTION", value or "")
+    section("SUMMARY", "source=%s" % source)
+    return EXIT_OK if value else EXIT_NO_MATCH
+
+
+def cmd_migrate_descriptions(args):
+    """Convert '** description' children into :DESCRIPTION: properties.
+
+    Re-parses after each conversion rather than tracking offsets: 30 nodes over
+    6000 lines is milliseconds, and offset bookkeeping across a splice that
+    both inserts and deletes is exactly where this kind of tool goes wrong.
+    """
+    doc = load(args)
+    original = doc
+    converted = []
+    while True:
+        target = None
+        for node in doc.nodes:
+            if doc.prop(node, "DESCRIPTION"):
+                continue
+            if args.depth is not None and node.level > args.depth:
+                continue
+            child = doc.description_child(node)
+            if child is not None:
+                target = (node, child)
+                break
+        if target is None:
+            break
+        node, child = target
+        text = doc.flatten(child)
+        if not text:
+            warn("skipping empty '** description' under %s" % node.path())
+            # Drop the empty child anyway so the loop terminates.
+            lines = list(doc.lines[:child.start]) + list(doc.lines[child.end:])
+        else:
+            lines = list(doc.lines[:child.start]) + list(doc.lines[child.end:])
+            doc = OrgDoc(doc.path, ensure_terminated(lines, doc.nl))
+            node = doc.find_by_line(node.line)
+            lines = set_properties(doc, node, {"DESCRIPTION": text})
+            converted.append(node.path())
+        doc = OrgDoc(doc.path, ensure_terminated(lines, doc.nl))
+
+    listing = "".join(p + "\n" for p in converted) or None
+    return commit(original, args, doc.lines,
+                  extra=[("CONVERTED", listing),
+                         ("SUMMARY", "converted=%d" % len(converted))])
+
+
+# ---------------------------------------------------------------------------
+# index - regenerates <file>.index.md in the format cfnote established
+# ---------------------------------------------------------------------------
+
+
+def cmd_index(args):
+    doc = load(args)
+    index_path = (os.path.abspath(os.path.expanduser(args.index))
+                  if args.index else re.sub(r"\.org$", "", doc.path) + ".index.md")
+
+    entries = []
+    for node in doc.nodes:
+        if node.level > args.depth:
+            continue
+        title = node.title
+        if node.level > 1:
+            title = node.path()
+        desc = doc.description(node)
+        entries.append((node, title, desc))
+
+    body = "".join(
+        "- %s: %s\n" % (t, d) if d else "- %s\n" % t
+        for _, t, d in entries)
+
+    counts = {}
+    for node, title, _ in entries:
+        counts.setdefault(norm(title), []).append(node)
+    duplicates = {k: v for k, v in counts.items() if len(v) > 1}
+
+    old = ""
+    if os.path.exists(index_path):
+        try:
+            with open(index_path, "r", encoding="utf-8") as fh:
+                old = fh.read()
+        except OSError as exc:
+            raise classify_oserror(exc, index_path)
+
+    old_titles = [re.sub(r": .*$", "", ln[2:]).strip()
+                  for ln in old.splitlines() if ln.startswith("- ")]
+    new_titles = [t for _, t, _ in entries]
+    added = [t for t in new_titles if t not in set(old_titles)]
+    removed = [t for t in old_titles if t not in set(new_titles)]
+
+    if args.dry_run:
+        status = "dry-run"
+    elif not old:
+        status = "created"
+    elif old == body:
+        status = "up-to-date"
+    else:
+        status = "updated"
+
+    if status in ("created", "updated"):
+        # The index is derived, never authored, so there is nothing to queue -
+        # if the mount is down, just re-run `orgcli index` when it is back.
+        try:
+            atomic_write(index_path, body)
+        except OSError as exc:
+            raise classify_oserror(exc, index_path)
+
+    if args.json:
+        emit_json({
+            "file": doc.path, "index": index_path, "status": status,
+            "headings": len(entries), "added": added, "removed": removed,
+            "duplicates": {k: [n.line for n in v] for k, v in duplicates.items()},
+            "preview": body if args.dry_run else None,
+        })
+        return EXIT_OK
+
+    section("FILE", doc.path)
+    section("INDEX", index_path)
+    section("SUMMARY", "status=%s headings=%d added=%d removed=%d duplicates=%d"
+            % (status, len(entries), len(added), len(removed), len(duplicates)))
+    if added:
+        section("ADDED", "".join(t + "\n" for t in added))
+    if removed:
+        section("REMOVED", "".join(t + "\n" for t in removed))
+    if duplicates:
+        # Duplicates make --path ambiguous, which is a hard error at lookup
+        # time, so surface them here rather than letting the next read fail.
+        section("DUPLICATE-HEADINGS")
+        for key in sorted(duplicates):
+            for node in duplicates[key]:
+                sys.stdout.write("%6d\t%s\n" % (node.line, node.title))
+    if args.dry_run:
+        section("PREVIEW", body)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# Write commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_set_body(args):
+    doc, node = begin_write(args)
+    new = text_to_lines(read_text(args), doc.nl)
+    start = doc.body_start(node)
+    end = node.end if args.include_children else node.own_end
+    return commit(doc, args, doc.lines[:start] + new + doc.lines[end:], node.line)
+
+
+def cmd_append(args):
+    doc, node = begin_write(args)
+    new = text_to_lines(read_text(args), doc.nl)
+    at = node.own_end  # end of this node's own body, before any children
+    return commit(doc, args, doc.lines[:at] + new + doc.lines[at:], node.line)
+
+
+def cmd_prepend(args):
+    doc, node = begin_write(args)
+    new = text_to_lines(read_text(args), doc.nl)
+    at = doc.body_start(node)  # after the planning line and property drawer
+    return commit(doc, args, doc.lines[:at] + new + doc.lines[at:], node.line)
+
+
+def cmd_add(args):
+    doc = load(args)
+    if args.parent is not None:
+        if args.path is not None:
+            raise UsageError("--parent and --path are the same thing; give one")
+        args.path = args.parent
+    root_level = args.root or args.path == "/"
+    if args.path == "/":
+        args.path = None
+    if not root_level and args.path is None and args.id is None and args.line is None:
+        # Never default to top level: a typo'd --parent should fail loudly, not
+        # quietly append a new level-1 node to the file.
+        raise UsageError("give --parent/--path/--id/--line for the parent node, "
+                         "or --root to create a top-level node")
+
+    if root_level:
+        parent, siblings, level = None, doc.roots, 1
+    else:
+        parent = doc.resolve(args)
+        check_if_match(doc, parent, args)
+        siblings, level = parent.children, parent.level + 1
+    if args.level is not None:
+        level = args.level
+
+    if args.before or args.after:
+        want = norm(args.before or args.after)
+        match = [n for n in siblings if norm(n.title) == want]
+        if not match:
+            raise NotFoundError('no sibling titled "%s"'
+                                % (args.before or args.after))
+        if len(match) > 1:
+            raise AmbiguousError('sibling "%s" is not unique'
+                                 % (args.before or args.after), match)
+        at = match[0].start if args.before else match[0].end
+    elif args.position == "first":
+        at = (siblings[0].start if siblings
+              else (len(doc.lines) if parent is None else parent.own_end))
+    else:
+        at = len(doc.lines) if parent is None else parent.end
+
+    node = Node(level, 0)
+    node.title = args.title
+    node.todo = args.todo
+    node.tags = parse_tags(args.tag)
+    block = [render_heading(node, doc.nl)]
+    text = read_text(args, required=False)
+    if text:
+        block += text_to_lines(text, doc.nl)
+
+    new_lines = doc.lines[:at] + block + doc.lines[at:]
+    return commit(doc, args, new_lines, at + 1)
+
+
+def cmd_delete(args):
+    doc, node = begin_write(args)
+    if not args.yes and not args.dry_run:
+        raise UsageError("refusing to delete %d lines without --yes "
+                         "(or use --dry-run to preview)" % (node.end - node.start))
+    return commit(doc, args, doc.lines[:node.start] + doc.lines[node.end:])
+
+
+def cmd_set_heading(args):
+    doc, node = begin_write(args)
+    node.title = args.title
+    lines = list(doc.lines)
+    lines[node.start] = render_heading(node, doc.nl)
+    return commit(doc, args, lines, node.line)
+
+
+def cmd_todo(args):
+    doc, node = begin_write(args)
+    old = node.todo
+    if args.clear:
+        new_state = None
+    else:
+        new_state = args.state
+        known = doc.all_keywords
+        if new_state.upper() in [k.upper() for k in known]:
+            new_state = next(k for k in known if k.upper() == new_state.upper())
+        elif not args.force:
+            raise UsageError(
+                "%s is not a TODO keyword in %s (known: %s). Use --force to "
+                "set it anyway." % (new_state, os.path.basename(doc.path),
+                                    " ".join(known)))
+    if old == new_state:
+        return commit(doc, args, list(doc.lines), node.line)
+
+    node.todo = new_state
+    lines = list(doc.lines)
+    lines[node.start] = render_heading(node, doc.nl)
+
+    if args.log_state:
+        # Same shape Emacs writes from org-log-note-headings' "%-12s" fields,
+        # so the line is indistinguishable from the ones already in daily.org.
+        stamp = time.strftime("%Y-%m-%d %a %H:%M")
+        entry = '- State %s from %s [%s]' % (
+            ('"%s"' % (new_state or "")).ljust(12),
+            ('"%s"' % (old or "")).ljust(12), stamp)
+        at = log_insert_point(doc, node)
+        lines = lines[:at] + [entry + doc.nl] + lines[at:]
+    return commit(doc, args, lines, node.line)
+
+
+def log_insert_point(doc, node):
+    """Top of an existing :LOGBOOK: drawer, else the start of the body.
+
+    daily.org uses both styles - 302 drawers and ~300 bare '- State ...' lines
+    - so match whichever the node already has instead of imposing one.
+    """
+    start = doc.body_start(node)
+    if start < node.own_end:
+        m = DRAWER_OPEN_RE.match(doc.text[start])
+        if m and m.group(2).upper() == "LOGBOOK":
+            return start + 1
+    return start
+
+
+def cmd_tag(args):
+    doc, node = begin_write(args)
+    tags = list(node.tags)
+    for tag in parse_tags(args.add):
+        if tag not in tags:
+            tags.append(tag)
+    for tag in split_csv(args.remove):
+        if tag in tags:
+            tags.remove(tag)
+    node.tags = tags
+    lines = list(doc.lines)
+    lines[node.start] = render_heading(node, doc.nl)
+    return commit(doc, args, lines, node.line)
+
+
+def cmd_prop(args):
+    doc, node = begin_write(args)
+    updates = {}
+    for item in args.set or []:
+        key, sep, value = item.partition("=")
+        if not sep:
+            raise UsageError("--set expects KEY=VALUE, got %r" % item)
+        updates[key.strip()] = value.strip()
+    for key in args.unset or []:
+        updates[key.strip()] = None
+    if not updates:
+        raise UsageError("nothing to do: pass --set KEY=VALUE or --unset KEY")
+    return commit(doc, args, set_properties(doc, node, updates), node.line)
+
+
+def split_csv(value):
+    if not value:
+        return []
+    return [v.strip() for v in re.split(r"[,:]", value) if v.strip()]
+
+
+VALID_TAG_RE = re.compile(r"^[A-Za-z0-9_@#%]+$")
+
+
+def parse_tags(value):
+    """Split and validate a --tag/--add list.
+
+    Org only allows [A-Za-z0-9_@#%] in a tag. Writing anything else produces a
+    ':foo bar:' that org does not read back as a tag, so the text silently
+    becomes part of the title instead - reject it here rather than corrupt the
+    heading.
+    """
+    tags = split_csv(value)
+    bad = [t for t in tags if not VALID_TAG_RE.match(t)]
+    if bad:
+        raise UsageError(
+            "invalid tag(s) %s: org tags may only contain letters, digits and "
+            "_ @ # %%" % ", ".join(repr(t) for t in bad))
+    return tags
+
+
+# ---------------------------------------------------------------------------
+# Recovery commands: pending, sync, restore
+# ---------------------------------------------------------------------------
+
+
+def cmd_pending(args):
+    """List, drop or clear queued edits."""
+    path = resolve_file(args.file) if args.file else None
+    entries = queue_entries(path)
+
+    if args.clear:
+        for entry in entries:
+            queue_drop(entry)
+        return report(args, "cleared", path or pending_dir(),
+                      queued=len(entries))
+    if args.drop:
+        hit = [e for e in entries if e["id"] == args.drop]
+        if not hit:
+            raise NotFoundError("no queued edit with id %s" % args.drop)
+        queue_drop(hit[0])
+        return report(args, "dropped", hit[0]["file"], queued=args.drop)
+
+    if args.json:
+        emit_json({
+            "pending": [{k: v for k, v in e.items() if not k.startswith("_")}
+                        for e in entries],
+            "count": len(entries),
+        })
+        return EXIT_OK
+
+    section("PENDING", None)
+    for entry in entries:
+        sys.stdout.write("%s  %s\n" % (entry["id"], entry["file"]))
+        sys.stdout.write("    created=%s  pre=%s  post=%s\n"
+                         % (entry["created"], entry["pre_sha"][:HASH_LEN],
+                            entry["post_sha"][:HASH_LEN]))
+        sys.stdout.write("    reason=%s\n" % entry["reason"])
+        sys.stdout.write("    argv=%s\n" % " ".join(entry.get("argv") or []))
+    section("SUMMARY", "count=%d  dir=%s" % (len(entries), pending_dir()))
+    return EXIT_OK if entries else EXIT_NO_MATCH
+
+
+class SyncConflict(Exception):
+    def __init__(self, entry, live_sha):
+        super().__init__(entry["id"])
+        self.entry = entry
+        self.live_sha = live_sha
+
+
+def sync_file(path, entries, dry_run=False, force=False):
+    """Replay one file's queue in order. Returns (applied, conflict-or-None).
+
+    Each entry records the sha of the content it was computed against. If that
+    still matches what is on the mount, writing the recorded content is
+    byte-identical to having run the original command now. If it does not,
+    something else edited the file while we were offline - stop, keep the
+    entry, and let a human look.
+    """
+    applied = []
+    for entry in entries:
+        arm_timeout()  # each entry gets its own budget, not a shared one
+        doc = OrgDoc.load(path, allow_mirror=False)
+        live = doc.content()
+        live_sha = sha_of(live)
+        if live_sha != entry["pre_sha"] and not force:
+            return applied, SyncConflict(entry, live_sha)
+        content = queue_content(entry)
+        if dry_run:
+            applied.append((entry, None))
+            continue
+        try:
+            backup = make_backup(path, live)
+            atomic_write(path, content)
+        except OSError as exc:
+            # The mount died again mid-replay. Classify so autosync can treat
+            # it as "still offline" and let the caller queue onto the end,
+            # rather than surfacing a bare OSError.
+            raise classify_oserror(exc, path)
+        mirror_put(path, content)
+        queue_drop(entry)
+        applied.append((entry, backup))
+    return applied, None
+
+
+def cmd_sync(args):
+    path = resolve_file(args.file) if args.file else None
+    entries = queue_entries(path)
+    if not entries:
+        return report(args, "nothing-to-sync", path or pending_dir(), queued=0)
+
+    by_file = {}
+    for entry in entries:
+        by_file.setdefault(entry["file"], []).append(entry)
+
+    applied, conflicts = [], []
+    for target in sorted(by_file):
+        done, conflict = sync_file(target, by_file[target],
+                                   dry_run=args.dry_run, force=args.force)
+        applied.extend(done)
+        if conflict is not None:
+            conflicts.append(conflict)
+
+    status = "dry-run" if args.dry_run else ("conflict" if conflicts else "synced")
+    if args.json:
+        emit_json({
+            "status": status,
+            "applied": [e["id"] for e, _ in applied],
+            "conflicts": [{
+                "id": c.entry["id"], "file": c.entry["file"],
+                "expected_sha": c.entry["pre_sha"], "live_sha": c.live_sha,
+                "content": c.entry["_body"],
+            } for c in conflicts],
+            "remaining": len(queue_entries(path)),
+        })
+        return EXIT_PRECONDITION if conflicts else EXIT_OK
+
+    section("SUMMARY", "status=%s  applied=%d  conflicts=%d  remaining=%d"
+            % (status, len(applied), len(conflicts), len(queue_entries(path))))
+    if applied:
+        section("APPLIED", "".join(
+            "%s  %s%s\n" % (e["id"], e["file"], "  backup=%s" % b if b else "")
+            for e, b in applied))
+    if conflicts:
+        body = []
+        for c in conflicts:
+            body.append(
+                "%s  %s\n  the file changed since this edit was made\n"
+                "  expected %s but found %s\n"
+                "  queued content: %s\n"
+                "  resolve with:   diff %s %s\n"
+                "  then:           orgcli sync --force   (or: orgcli pending --drop %s)\n"
+                % (c.entry["id"], c.entry["file"],
+                   c.entry["pre_sha"][:HASH_LEN], c.live_sha[:HASH_LEN],
+                   c.entry["_body"], c.entry["file"], c.entry["_body"],
+                   c.entry["id"]))
+        section("CONFLICTS", "".join(body))
+    return EXIT_PRECONDITION if conflicts else EXIT_OK
+
+
+def autosync(path):
+    """Drain `path`'s queue before a write command touches it.
+
+    Only write commands call this. A read must never have the side effect of
+    writing to the user's notes, so reads just warn (see warn_pending).
+    """
+    entries = queue_entries(path)
+    if not entries:
+        return
+    try:
+        applied, conflict = sync_file(path, entries)
+    except StorageError as exc:
+        # Still offline. Nothing can be replayed, but the command that follows
+        # can still queue onto the end - so warn and get out of its way rather
+        # than failing it for a condition it is designed to survive.
+        warn("cannot flush %d queued edit(s) yet: %s" % (len(entries), exc.message))
+        return
+    if applied:
+        section("SYNCED", "".join("%s  (queued %s)\n" % (e["id"], e["created"])
+                                  for e, _ in applied))
+    if conflict is not None:
+        raise PreconditionError(
+            "%s has %d queued edit(s) that no longer apply: %s expected the "
+            "file at %s but it is now %s. Resolve with `orgcli sync` before "
+            "writing again."
+            % (path, len(queue_entries(path)), conflict.entry["id"],
+               conflict.entry["pre_sha"][:HASH_LEN], conflict.live_sha[:HASH_LEN]))
+
+
+def warn_pending(path):
+    n = len(queue_entries(path))
+    if n:
+        warn("%d edit(s) queued for %s are not on gdrive yet; run: orgcli sync"
+             % (n, path))
+
+
+def backups_for(path):
+    """Every backup of `path`'s basename, newest first."""
+    directory = backup_dir()
+    prefix = os.path.basename(path) + "." if path else ""
+    try:
+        names = [n for n in os.listdir(directory) if n.startswith(prefix)]
+    except OSError:
+        return []
+    out = []
+    for name in sorted(names, reverse=True):
+        full = os.path.join(directory, name)
+        try:
+            stat = os.stat(full)
+        except OSError:
+            continue
+        out.append((name, full, stat))
+    return out
+
+
+def cmd_restore(args):
+    """Put a backup from $ORGCLI_BACKUP_DIR back. The safety net already
+    existed; this is the UI for it."""
+    path = resolve_file(args.file) if args.file else None
+
+    if args.list or not args.backup:
+        found = backups_for(path)
+        if args.json:
+            emit_json({"dir": backup_dir(), "file": path, "backups": [
+                {"name": n, "path": p, "bytes": s.st_size,
+                 "modified": time.strftime("%Y-%m-%dT%H:%M:%S",
+                                           time.localtime(s.st_mtime))}
+                for n, p, s in found]})
+            return EXIT_OK if found else EXIT_NO_MATCH
+        section("BACKUPS", None)
+        for name, _, stat in found:
+            sys.stdout.write("%s  %8s  %s\n" % (
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+                human_size(stat.st_size), name))
+        section("SUMMARY", "count=%d  dir=%s" % (len(found), backup_dir()))
+        if not args.backup:
+            return EXIT_OK if found else EXIT_NO_MATCH
+
+    if not path:
+        raise UsageError("restoring needs --file, so orgcli knows where to put it")
+    source = args.backup
+    if os.sep not in source:
+        source = os.path.join(backup_dir(), source)
+    try:
+        with open(source, "r", encoding="utf-8", newline="") as fh:
+            content = fh.read()
+    except OSError as exc:
+        raise UsageError("cannot read backup %s: %s" % (source, exc))
+
+    try:
+        live = raw_read(path)
+    except FileNotFoundError:
+        # The org file is gone, which is exactly what restore is for. Do not
+        # apply the mirror heuristic classify_oserror uses for reads - it
+        # would read "we have seen this file before" as a dead mount and
+        # refuse. Restore is explicit, so instead just check that the
+        # directory is genuinely reachable before recreating the file in it.
+        try:
+            os.stat(os.path.dirname(path) or ".")
+        except OSError as exc:
+            raise classify_oserror(exc, path)
+        live = ""
+    except OSError as exc:
+        raise classify_oserror(exc, path)
+    if live == content:
+        return report(args, "unchanged", path)
+    if args.dry_run:
+        return report(args, "dry-run", path,
+                      [("DIFF", diff_text(live, content, path))])
+    backup = make_backup(path, live)
+    try:
+        atomic_write(path, content)
+    except OSError as exc:
+        raise classify_oserror(exc, path)
+    mirror_put(path, content)
+    return report(args, "restored", path, backup=backup)
+
+
+# ---------------------------------------------------------------------------
+# guide - the page an agent reads before its first call
+# ---------------------------------------------------------------------------
+
+GUIDE = """\
+orgcli - working with big org files without reading them
+========================================================
+
+The point of this tool is that you never `Read` the .org file. tools.org is
+6,000 lines and archive.org is 24,000; a cftask logs.org can be 2.4 MB. Load
+one node instead.
+
+1. The read ladder - cheapest first
+-----------------------------------
+
+  orgcli outline -f tools --depth 1 --desc --stats
+      The whole file as ~120 lines: title, description, and how big each node
+      is. Read this first. --stats tells you what a `show` will cost before
+      you pay for it.
+
+  orgcli search -f tools 'hipstercli' --context 1
+      Line hits with the owning node's path. Use this when you know a literal
+      term but not where it lives.
+
+  orgcli show -f tools --path 'acl/bulk edit'
+      Exactly one subtree. Add --depth 1 for the node's own body without its
+      children, or --max-lines 80 to cap a node you are not sure about.
+
+Only fall back to Read/Grep on the raw file if orgcli cannot express what you
+need - and if you do, `orgcli path -f tools --line <N>` converts a line number
+back into a stable heading path. The line need not be a heading: any line
+resolves to the node containing it.
+
+2. Addressing
+-------------
+
+Every node-targeting command takes exactly one of --path, --id, --line.
+
+  --path 'acl/bulk edit/copy_permissions'
+      Case-insensitive, whitespace-normalised, '/'-separated. Escape a literal
+      slash in a title as '\\/' - e.g. --path 'hg \\/ jf \\/ sl'.
+      Segments must be a contiguous parent->child chain, but need not start at
+      the top: --path copy_permissions finds that node at whatever depth it
+      lives. If exactly one match is shallowest, that one wins; otherwise you
+      get exit 4 and a ---CANDIDATES--- list of "<line>\\t<full path>". Re-run
+      with a longer --path or with --line from that list.
+  --line N   the heading must start on line N. Unambiguous, but only valid
+             until the file changes.
+  --id UUID  from the node's :PROPERTIES: drawer. Nodes have no ID until you
+             mint one with `orgcli id --path P --ensure`; do that when you
+             expect to edit a node repeatedly across a long session.
+
+3. Writing
+----------
+
+Read, then write with the hash you read:
+
+    h=$(orgcli show -f tools --path 'acl/amp' --json | python3 -c \\
+        'import json,sys; print(json.load(sys.stdin)["hash"])')
+    orgcli append -f tools --path 'acl/amp' --if-match "$h" --text '- new bullet'
+
+--if-match makes the write fail (exit 3) if the node changed since you read
+it, which is the only protection against clobbering a concurrent edit from
+Emacs or another agent. Always preview a non-trivial change with --dry-run
+first; it prints a unified diff and writes nothing.
+
+Body text comes from --text, --text-file PATH, --text-file - , or bare stdin.
+Prefer a heredoc for anything multi-line - org bodies are full of '*', '=' and
+'$', and shell quoting is where hand-built commands corrupt notes:
+
+    orgcli set-body -f tools --path 'acl/amp' --text-file - <<'EOF'
+    - bunnylol =amp=
+    #+begin_src sh
+      $ hipstercli add --reason $TASK
+    #+end_src
+    EOF
+
+Which command:
+    append / prepend   add to the end / start of a node's own body
+    set-body           replace the body; children survive unless
+                       --include-children
+    add                new child node (--parent P, or --root for top level)
+    set-heading        rename, preserving TODO state, priority and tags
+    delete             remove a subtree; needs --yes
+    todo / tag / prop  metadata, without touching the body
+    describe           set the node's one-line summary
+
+Every write backs the file up to ~/.cache/orgcli/backups first.
+There is no move/refile/promote/demote: restructuring is a human's job.
+
+4. Descriptions
+---------------
+
+A one-line summary per node, so the next agent can route from `outline` alone
+instead of reading bodies. Stored as a :DESCRIPTION: property:
+
+    orgcli describe -f tools --path acl --text 'ACL management for Hipster: ...'
+
+Reads also accept the older convention - a '** description' child section, as
+used by ~30 nodes in tools.org - so nothing needs migrating first. Writes
+always go to the property. `orgcli describe --missing --depth 1` lists nodes
+that have neither; it never writes.
+
+After adding or renaming a level-1 node in tools.org, re-run
+`orgcli index -f tools` to refresh tools.index.md.
+
+5. Output and exit codes
+------------------------
+
+Plain output is ---SECTION--- blocks; --json gives one object per command and
+is what you want if you are parsing. Common JSON keys: path, title, level,
+start, end, lines, hash, todo, tags, id, description.
+
+    0  ok
+    1  no match            the path/id/line resolved to nothing, or a search
+                           found nothing
+    2  usage or file error  fix the command
+    3  --if-match failed    re-read the node and retry with the new hash;
+                           also a sync conflict, which needs `orgcli sync`
+    4  ambiguous --path     see ---CANDIDATES---, then use a longer path or
+                           --line
+    5  storage unavailable  the gdrive mount is down. THE ONLY CODE WORTH
+                           RETRYING. Do not treat it as "not found" and do
+                           not re-create the node you were looking for.
+
+6. Files
+--------
+
+-f accepts a bare name resolved against $ORGCLI_DIR (default ~/gdrive/org-meta),
+so `-f tools` means ~/gdrive/org-meta/tools.org. Anything with a '/' or a
+'.org' suffix is used as a path. $ORGCLI_FILE sets a default.
+
+7. When the mount is down
+-------------------------
+
+The notes sit on a fuse.rclone gdrive mount that dies periodically. orgcli is
+built to keep going rather than block you, but the cost is that "the command
+succeeded" and "gdrive has your edit" stop being the same thing. Read the
+status, not just the exit code.
+
+  Reads   Exit 5 when the file is unreachable. That is the default: orgcli
+          does not keep a copy of your notes unless you ask it to.
+
+          Set ORGCLI_MIRROR=1 and every good read is copied to
+          ~/.cache/orgcli/mirror; an unreachable file is then served from
+          there, stale, with a warning on stderr (never stdout, so --json
+          stays parseable). Worth it if you work through outages; the cost is
+          a second copy on local disk that can be handed back in place of the
+          real file.
+
+  Writes  A write that cannot reach the mount - or that edited a doc which
+          came from the mirror, and so might be behind the real file - is
+          parked in ~/.cache/orgcli/pending and reported as
+
+              status=queued  queued=<id>  reason=...
+
+          Exit 0, because nothing was lost: the edit is on local disk. But it
+          is NOT on gdrive. Never report a queued edit to the user as saved.
+
+          A file holds at most one queued edit unless orgcli can tell what the
+          previous one left behind - which needs ORGCLI_MIRROR=1. Without it a
+          second edit exits 3 and is dropped rather than queued, because it
+          was computed against the pre-queue file and applying both would
+          revert the first. The queue itself is untouched; sync it and redo.
+
+  Draining  The next write to that file replays its queue first and prints
+          ---SYNCED---. `orgcli sync` does it on demand; `orgcli pending`
+          lists what is waiting and exits 1 when nothing is, so
+          `orgcli pending >/dev/null` answers "is everything flushed?".
+
+  Conflicts  Each queued edit remembers the hash of the content it was built
+          on. If the file changed underneath - Emacs, another machine - sync
+          stops on that file with exit 3 rather than guessing. It prints the
+          path of the queued content so you can diff it, then either
+          `orgcli sync --force` or `orgcli pending --drop <id>`.
+
+If the mount is down, fixing it beats working around it - remount, then
+`orgcli sync`. The queue is there so a mount that dies mid-session does not
+cost you the edit, not as a substitute for a working mount.
+
+`orgcli restore --list` shows the pre-write backups, and
+`orgcli restore -f <file> --backup <name>` rolls one back. Restoring takes its
+own backup first, so it is undoable too.
+
+To rehearse any of this without breaking a real mount, set ORGCLI_FAULT to
+read, write, rename, both or hang - it makes the filesystem calls fail on
+purpose and is inert when unset.
+"""
+
+# The grouped command list in `orgcli --help`. Rendered from this rather than
+# hand-written prose so it cannot drift from the registered subcommands; the
+# test suite asserts the two sets are equal.
+COMMAND_GROUPS = [
+    ("READ", [
+        ("outline", "heading tree, with sizes, TODO states, descriptions"),
+        ("show", "one node's content"),
+        ("search", "regex over headings and/or bodies"),
+        ("path", "line number or ID -> heading path"),
+        ("describe", "read or set a node's one-line summary"),
+        ("props", "property drawer"),
+        ("id", "read or mint an org-id UUID"),
+        ("index", "regenerate <file>.index.md"),
+        ("guide", "the recommended agent workflow, in full"),
+    ]),
+    ("WRITE", [
+        ("append", "add to the end of a node's body"),
+        ("prepend", "add to the start of a node's body"),
+        ("set-body", "replace a node's body"),
+        ("add", "create a new node"),
+        ("delete", "remove a subtree"),
+        ("set-heading", "rename a node"),
+        ("todo", "set or clear a TODO state"),
+        ("tag", "add or remove tags"),
+        ("prop", "set or unset properties"),
+        ("migrate-descriptions", "'** description' children -> properties"),
+    ]),
+    ("RECOVERY", [
+        ("pending", "edits queued while storage was unavailable"),
+        ("sync", "replay queued edits onto the real file"),
+        ("restore", "list or roll back to a pre-write backup"),
+    ]),
+]
+
+
+def render_command_groups():
+    width = max(len(name) for _, cmds in COMMAND_GROUPS for name, _ in cmds)
+    gutter = max(len(label) for label, _ in COMMAND_GROUPS) + 1
+    out = []
+    for label, cmds in COMMAND_GROUPS:
+        for i, (name, blurb) in enumerate(cmds):
+            out.append("%s%s  %s" % ((label if i == 0 else "").ljust(gutter),
+                                     name.ljust(width), blurb))
+        out.append("")
+    return "\n".join(out)
+
+
+TOP_DESCRIPTION = """\
+orgcli - structured read/write access to large org-mode files.
+
+Address one node, read one node, change one node. Never loads the whole file
+into context. Files are edited by line splice, so untouched bytes round-trip
+exactly.
+
+%s""" % render_command_groups()
+
+TOP_EPILOG = """\
+addressing (node-targeting commands take exactly one):
+  --path 'acl/bulk edit/copy_permissions'
+                        case-insensitive, '/'-separated; escape a literal
+                        slash as '\\/'. Need not start at level 1.
+  --id 4f3a1c8e-...     org-id from the node's :PROPERTIES: drawer
+  --line 2359           a heading must start on that line
+  An ambiguous --path is never guessed: exit 4, with every candidate listed.
+
+writes:
+  --dry-run             print a unified diff and change nothing
+  --if-match <hash>     refuse if the node changed since you read it (the
+                        hash comes from `show`)
+  --no-backup           skip the pre-write backup (on by default)
+
+when storage is down (the notes live on a gdrive FUSE mount):
+  reads fall back to a local mirror and say so on stderr; writes are queued
+  to ~/.cache/orgcli/pending and reported as status=queued, NOT written.
+  The next write to that file replays the queue first; `orgcli sync` forces
+  it. Only exit 5 is worth retrying.
+
+exit codes:
+  0 ok   1 no match   2 usage/file error   3 --if-match failed or sync
+  conflict   4 ambiguous   5 storage unavailable (retry later)
+
+environment:
+  ORGCLI_FILE           default --file
+  ORGCLI_DIR            where bare names resolve (default ~/gdrive/org-meta)
+  ORGCLI_BACKUP_DIR     default ~/.cache/orgcli/backups
+  ORGCLI_CACHE_DIR      mirror and queue (default ~/.cache/orgcli)
+  ORGCLI_TIMEOUT        seconds before a hung mount is given up on
+                        (default 10; 0 disables)
+  ORGCLI_MIRROR=1       mirror every read, so a read still works when the
+                        mount is down. Off by default: it keeps a second copy
+                        of the notes on local disk that can be served in
+                        place of the real file. The write queue works either
+                        way and keeps its own chain regardless.
+  ORGCLI_NO_QUEUE=1     fail writes outright instead of queueing them
+  ORGCLI_FAULT          test seam: pretend the mount is broken; see
+                        `orgcli guide`
+
+Run 'orgcli guide' for the full workflow, or 'orgcli <command> --help' for
+per-command flags and worked examples.
+"""
+
+
+def cmd_guide(args):
+    sys.stdout.write(GUIDE)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+#
+# Subcommands are listed by purpose in TOP_DESCRIPTION rather than dumped
+# alphabetically by argparse, and every subparser carries an examples: epilog.
+# tests/test_orgcli.py asserts both, so a new command cannot ship undocumented.
+# ---------------------------------------------------------------------------
+
+
+class Formatter(argparse.RawDescriptionHelpFormatter):
+    def __init__(self, prog, **kwargs):
+        kwargs.setdefault("max_help_position", 30)
+        super().__init__(prog, **kwargs)
+
+
+def add_file(parser, required=True):
+    """`required=False` is for the recovery commands, which default to acting
+    on every file that has queued edits or backups rather than just one."""
+    parser.add_argument(
+        "-f", "--file", metavar="FILE",
+        help="org file; a bare name like 'tools' resolves to $ORGCLI_DIR/tools.org "
+             "(default: $ORGCLI_FILE)" if required else
+             "org file to narrow to (default: all of them)")
+
+
+def add_target(parser, required_text="the node to act on", optional=False):
+    group = parser.add_argument_group("addressing", required_text)
+    group.add_argument("--path", metavar="P",
+                       help="heading path, '/'-separated, case-insensitive; "
+                            "escape a literal slash as '\\/'")
+    group.add_argument("--id", metavar="UUID", help="org-id from the :ID: property")
+    group.add_argument("--line", type=int, metavar="N",
+                       help="line number the heading starts on")
+    group.add_argument("--strict-root", action="store_true",
+                       help="require the first --path segment to be a level-1 heading")
+
+
+def add_write(parser):
+    group = parser.add_argument_group("write safety")
+    group.add_argument("--dry-run", action="store_true",
+                       help="print a unified diff and change nothing")
+    group.add_argument("--if-match", metavar="HASH",
+                       help="refuse (exit 3) unless the node's hash still matches")
+    group.add_argument("--no-backup", action="store_true",
+                       help="skip the pre-write backup to $ORGCLI_BACKUP_DIR")
+    group.add_argument("--ensure-id", action="store_true",
+                       help="mint an :ID: for the node if it has none")
+
+
+def add_text(parser):
+    group = parser.add_argument_group("body text", "one of these, or bare stdin")
+    group.add_argument("--text", metavar="STR", help="text given inline")
+    group.add_argument("--text-file", metavar="PATH",
+                       help="read text from a file, or '-' for stdin")
+
+
+def add_json(parser):
+    parser.add_argument("--json", action="store_true",
+                        help="emit one JSON object instead of ---SECTION--- blocks")
+
+
+def sub(subparsers, name, help_text, epilog):
+    # Passing no `help` at all is what keeps argparse from printing a second,
+    # alphabetical command list underneath the grouped one in TOP_DESCRIPTION.
+    # (help=SUPPRESS does not work here: add_parser stores the sentinel string
+    # and prints it.) The test suite checks the grouped list and the registered
+    # subparsers stay in sync.
+    return subparsers.add_parser(
+        name, description=help_text, epilog=epilog, formatter_class=Formatter)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="orgcli", description=TOP_DESCRIPTION, epilog=TOP_EPILOG,
+        formatter_class=Formatter)
+    parser.add_argument("--version", action="version", version="orgcli 1.0.0")
+    subparsers = parser.add_subparsers(dest="cmd", metavar="<command>",
+                                       title="commands")
+
+    # -- read ------------------------------------------------------------
+
+    p = sub(subparsers, "outline", "Heading tree, with sizes and descriptions.", """\
+examples:
+  # the whole file as a routing table - start here
+  orgcli outline -f tools --depth 1 --desc --stats
+
+  # drill into one subtree
+  orgcli outline -f tools --path acl --depth 3
+
+  # everything still open in the daily log
+  orgcli outline -f daily --todo TODO
+""")
+    add_file(p)
+    add_target(p, "optional: scope the outline to one subtree")
+    p.add_argument("--depth", type=int, metavar="N",
+                   help="levels to show, counting the scope root as 1")
+    p.add_argument("--stats", action="store_true",
+                   help="append each node's line and byte count")
+    p.add_argument("--desc", action="store_true",
+                   help="append each node's description")
+    p.add_argument("--todo", nargs="?", const="*", metavar="STATE",
+                   help="only nodes with a TODO keyword, or with this one")
+    p.add_argument("--tag", metavar="TAG", help="only nodes carrying this tag")
+    add_json(p)
+    p.set_defaults(func=cmd_outline)
+
+    p = sub(subparsers, "show", "Print one node.", """\
+examples:
+  orgcli show -f tools --path acl
+  orgcli show -f tools --path 'acl/bulk edit/copy_permissions'
+
+  # the node's own body, without its children
+  orgcli show -f tools --path acl --depth 1
+
+  # peek at something large before committing to it
+  orgcli show -f tools --path servicerouter --max-lines 40
+""")
+    add_file(p)
+    add_target(p)
+    p.add_argument("--depth", type=int, metavar="N",
+                   help="levels to include, counting the node as 1 "
+                        "(default: the whole subtree)")
+    p.add_argument("--body-only", action="store_true",
+                   help="just the node's own body, no heading, no children")
+    p.add_argument("--headings-only", action="store_true",
+                   help="just the subtree's headings")
+    p.add_argument("--max-lines", type=int, metavar="N", help="truncate the output")
+    add_json(p)
+    p.set_defaults(func=cmd_show)
+
+    p = sub(subparsers, "search", "Regex over headings and/or bodies.", """\
+examples:
+  orgcli search -f tools 'hipstercli' --context 1
+  orgcli search -f tools --in heading -i 'scuba'
+  orgcli search -f tools --path servicerouter 'smc' --limit 20
+
+  # literal text, no regex escaping needed
+  orgcli search -f tools --fixed 'C++ :includes'
+""")
+    add_file(p)
+    add_target(p, "optional: restrict the search to one subtree")
+    p.add_argument("pattern", help="Python regex, or literal text with --fixed")
+    p.add_argument("--in", dest="where", choices=("heading", "body", "all"),
+                   default="all", help="where to look (default: all)")
+    p.add_argument("-i", "--ignore-case", action="store_true", help="case-insensitive")
+    p.add_argument("--fixed", action="store_true", help="treat the pattern as literal text")
+    p.add_argument("--context", type=int, default=0, metavar="N",
+                   help="lines of context around each hit")
+    p.add_argument("--limit", type=int, default=50, metavar="N",
+                   help="stop after N matches (default: 50)")
+    add_json(p)
+    p.set_defaults(func=cmd_search)
+
+    p = sub(subparsers, "path", "Turn a line number or ID into a heading path.", """\
+examples:
+  # you found line 2359 with Grep; what node is that?
+  orgcli path -f tools --line 2359
+
+  orgcli path -f tools --id 4f3a1c8e-6d02-4b7a-9c11-8e5a2f0d9b21
+
+--line does not have to be a heading: any line resolves to the node that
+contains it, and the output says whether the match was exact or containing.
+Every other command requires --line to be a heading line exactly.
+""")
+    add_file(p)
+    add_target(p)
+    add_json(p)
+    p.set_defaults(func=cmd_path)
+
+    p = sub(subparsers, "describe", "Read or set a node's one-line summary.", """\
+examples:
+  # read (falls back to a '** description' child if there is no property)
+  orgcli describe -f tools --path acl
+
+  # set
+  orgcli describe -f tools --path acl --text 'ACL management for Hipster: ...'
+
+  # what still needs one? this never writes
+  orgcli describe -f tools --missing --depth 1
+""")
+    add_file(p)
+    add_target(p, "the node to describe (not needed with --missing)")
+    add_text(p)
+    add_write(p)
+    p.add_argument("--clear", action="store_true", help="remove the :DESCRIPTION: property")
+    p.add_argument("--missing", action="store_true",
+                   help="list nodes that have no description")
+    p.add_argument("--depth", type=int, metavar="N", help="with --missing, levels to scan")
+    add_json(p)
+    p.set_defaults(func=cmd_describe)
+
+    p = sub(subparsers, "props", "Show a node's property drawer.", """\
+examples:
+  orgcli props -f tools --path acl
+  orgcli props -f tools --path acl --json
+""")
+    add_file(p)
+    add_target(p)
+    add_json(p)
+    p.set_defaults(func=cmd_props)
+
+    p = sub(subparsers, "id", "Read or mint a node's org-id UUID.", """\
+examples:
+  orgcli id -f tools --path acl              # exit 1 if it has none
+  orgcli id -f tools --path acl --ensure     # mint one and write the drawer
+""")
+    add_file(p)
+    add_target(p)
+    add_write(p)
+    p.add_argument("--ensure", action="store_true",
+                   help="create an :ID: if the node has none")
+    add_json(p)
+    p.set_defaults(func=cmd_id)
+
+    p = sub(subparsers, "index", "Regenerate <file>.index.md.", """\
+examples:
+  orgcli index -f tools --dry-run     # preview, and list duplicate headings
+  orgcli index -f tools               # write it
+
+Run this after adding, removing or renaming a level-1 heading. Duplicate
+titles are reported because they make --path ambiguous.
+""")
+    add_file(p)
+    p.add_argument("--index", metavar="PATH",
+                   help="output file (default: <file>.index.md)")
+    p.add_argument("--depth", type=int, default=1, metavar="N",
+                   help="heading levels to index (default: 1)")
+    p.add_argument("--dry-run", action="store_true", help="preview without writing")
+    add_json(p)
+    p.set_defaults(func=cmd_index)
+
+    p = sub(subparsers, "guide", "Print the full agent workflow guide.",
+            "examples:\n  orgcli guide\n  orgcli guide | head -40\n")
+    p.set_defaults(func=cmd_guide)
+
+    # -- write -----------------------------------------------------------
+
+    p = sub(subparsers, "set-body", "Replace a node's body.", """\
+examples:
+  orgcli set-body -f tools --path 'acl/amp' --text-file - --dry-run <<'EOF'
+  - bunnylol =amp=
+  EOF
+
+  # also discard the node's children
+  orgcli set-body -f tools --path 'acl/amp' --include-children --text '- fresh'
+""")
+    add_file(p)
+    add_target(p)
+    add_text(p)
+    add_write(p)
+    p.add_argument("--include-children", action="store_true",
+                   help="replace the whole subtree below the heading, not just "
+                        "the node's own body")
+    p.set_defaults(func=cmd_set_body)
+
+    p = sub(subparsers, "append", "Add text to the end of a node's own body.", """\
+examples:
+  orgcli append -f tools --path 'acl/amp' --text '- bunnylol =amp='
+
+  # the safe pattern: read the hash, then write against it
+  h=$(orgcli show -f tools --path 'acl/amp' --json | \\
+      python3 -c 'import json,sys; print(json.load(sys.stdin)["hash"])')
+  orgcli append -f tools --path 'acl/amp' --if-match "$h" --text-file - <<'EOF'
+  - see also =hipstercli=
+  EOF
+
+Text lands at the end of the node's own body, before any child headings.
+""")
+    add_file(p)
+    add_target(p)
+    add_text(p)
+    add_write(p)
+    p.set_defaults(func=cmd_append)
+
+    p = sub(subparsers, "prepend", "Add text to the start of a node's body.", """\
+examples:
+  orgcli prepend -f daily --path tasks --text '- newest first'
+
+Text lands after any SCHEDULED/DEADLINE line and property drawer.
+""")
+    add_file(p)
+    add_target(p)
+    add_text(p)
+    add_write(p)
+    p.set_defaults(func=cmd_prepend)
+
+    p = sub(subparsers, "add", "Create a new node.", """\
+examples:
+  # new child at the end of a node
+  orgcli add -f tools --parent acl --title 'notes'
+
+  # new level-1 node
+  orgcli add -f tools --root --title 'newtool' --text '- first note'
+
+  # placed relative to a sibling
+  orgcli add -f tools --parent acl --title 'links' --before 'bulk edit'
+
+  # a TODO item at the top of today's list
+  orgcli add -f daily --parent tasks --title 'file the report' \\
+      --todo TODO --position first
+""")
+    add_file(p)
+    add_target(p, "the parent node (or use --root)")
+    p.add_argument("--parent", metavar="P", help="alias for --path: the parent node")
+    p.add_argument("--root", action="store_true", help="create a top-level node")
+    p.add_argument("--title", required=True, help="heading text")
+    p.add_argument("--todo", metavar="STATE", help="TODO keyword for the new heading")
+    p.add_argument("--tag", metavar="TAGS", help="colon- or comma-separated tags")
+    p.add_argument("--level", type=int, metavar="N",
+                   help="override the level inferred from the parent")
+    p.add_argument("--position", choices=("first", "last"), default="last",
+                   help="among the parent's children (default: last)")
+    p.add_argument("--before", metavar="TITLE", help="insert before this sibling")
+    p.add_argument("--after", metavar="TITLE", help="insert after this sibling")
+    add_text(p)
+    add_write(p)
+    p.set_defaults(func=cmd_add)
+
+    p = sub(subparsers, "delete", "Remove a node and its subtree.", """\
+examples:
+  orgcli delete -f tools --path 'acl/notes' --dry-run    # always look first
+  orgcli delete -f tools --path 'acl/notes' --yes
+""")
+    add_file(p)
+    add_target(p)
+    add_write(p)
+    p.add_argument("--yes", action="store_true", help="required to actually delete")
+    p.set_defaults(func=cmd_delete)
+
+    p = sub(subparsers, "set-heading", "Rename a node.", """\
+examples:
+  orgcli set-heading -f tools --path hg --title 'hg / jf / sl'
+
+TODO state, priority and tags are preserved. Note that renaming changes the
+node's --path, and a level-1 rename means the index needs regenerating.
+""")
+    add_file(p)
+    add_target(p)
+    add_write(p)
+    p.add_argument("--title", required=True, help="new heading text")
+    p.set_defaults(func=cmd_set_heading)
+
+    p = sub(subparsers, "todo", "Set or clear a node's TODO state.", """\
+examples:
+  orgcli todo -f daily --path 'tasks/review D108894531' --state DONE
+  orgcli todo -f daily --path 'tasks/oh' --state DONE --log-state
+  orgcli todo -f daily --path 'tasks/oh' --clear
+
+--log-state adds a '- State "DONE" from "TODO" [ts]' line, into the node's
+:LOGBOOK: drawer if it has one. States are checked against the file's own
+#+TODO:/#+SEQ_TODO: keywords; --force overrides.
+""")
+    add_file(p)
+    add_target(p)
+    add_write(p)
+    p.add_argument("--state", metavar="STATE", help="the new TODO keyword")
+    p.add_argument("--clear", action="store_true", help="remove the TODO keyword")
+    p.add_argument("--log-state", action="store_true", help="record the transition")
+    p.add_argument("--force", action="store_true",
+                   help="allow a state the file does not declare")
+    p.set_defaults(func=cmd_todo)
+
+    p = sub(subparsers, "tag", "Add or remove heading tags.", """\
+examples:
+  orgcli tag -f tools --path acl --add security,infra
+  orgcli tag -f tools --path acl --remove infra
+""")
+    add_file(p)
+    add_target(p)
+    add_write(p)
+    p.add_argument("--add", metavar="TAGS", help="comma- or colon-separated")
+    p.add_argument("--remove", metavar="TAGS", help="comma- or colon-separated")
+    p.set_defaults(func=cmd_tag)
+
+    p = sub(subparsers, "prop", "Set or unset properties.", """\
+examples:
+  orgcli prop -f tools --path acl --set OWNER=chunfengd --set STATUS=active
+  orgcli prop -f tools --path acl --unset STATUS
+
+Creates the :PROPERTIES: drawer if the node has none, and removes it again
+when the last property goes.
+""")
+    add_file(p)
+    add_target(p)
+    add_write(p)
+    p.add_argument("--set", action="append", metavar="KEY=VALUE",
+                   help="set a property (repeatable)")
+    p.add_argument("--unset", action="append", metavar="KEY",
+                   help="remove a property (repeatable)")
+    p.set_defaults(func=cmd_prop)
+
+    p = sub(subparsers, "migrate-descriptions",
+            "Convert '** description' children to :DESCRIPTION: properties.", """\
+examples:
+  orgcli migrate-descriptions -f tools --dry-run
+  orgcli migrate-descriptions -f tools
+
+Opt-in and not run by anything else - reads already understand both forms.
+""")
+    add_file(p)
+    p.add_argument("--depth", type=int, metavar="N",
+                   help="only convert nodes at or above this level")
+    add_write(p)
+    p.set_defaults(func=cmd_migrate_descriptions)
+
+    # -- recovery ---------------------------------------------------------
+
+    p = sub(subparsers, "pending",
+            "Edits that were queued because storage was unavailable.", """\
+examples:
+  orgcli pending                      # everything still waiting
+  orgcli pending -f tools --json
+  orgcli pending --drop 20260830-141530-01234-00
+  orgcli pending --clear              # abandon them all
+
+A queued edit is on local disk, not on gdrive. Exit 1 when nothing is queued,
+so `orgcli pending >/dev/null` is a usable "is everything flushed?" check.
+""")
+    add_file(p, required=False)
+    p.add_argument("--drop", metavar="ID", help="discard one queued edit")
+    p.add_argument("--clear", action="store_true", help="discard all of them")
+    add_json(p)
+    p.set_defaults(func=cmd_pending)
+
+    p = sub(subparsers, "sync",
+            "Replay queued edits onto the real file.", """\
+examples:
+  orgcli sync                         # everything, oldest first
+  orgcli sync -f tools --dry-run
+  orgcli sync --force                 # apply even where the file moved on
+
+Each edit remembers the hash of the content it was computed against. If the
+file still matches, replaying is byte-identical to having run the original
+command now. If it does not, sync stops on that file and exits 3 rather than
+guessing - the queued content is left on disk for you to diff.
+
+Write commands sync their own file automatically, so this is mainly for
+flushing by hand after a mount comes back.
+""")
+    add_file(p, required=False)
+    p.add_argument("--dry-run", action="store_true",
+                   help="report what would be applied and change nothing")
+    p.add_argument("--force", action="store_true",
+                   help="apply even when the file changed underneath")
+    add_json(p)
+    p.set_defaults(func=cmd_sync)
+
+    p = sub(subparsers, "restore",
+            "List or roll back to a pre-write backup.", """\
+examples:
+  orgcli restore --list                        # every backup
+  orgcli restore --list -f tools               # just this file's
+  orgcli restore -f tools --backup tools.org.20260830-141530-1234 --dry-run
+  orgcli restore -f tools --backup tools.org.20260830-141530-1234
+
+Every write leaves a copy in $ORGCLI_BACKUP_DIR (default %s) first, so this
+undoes a bad edit even if the org file has since been mangled by something
+else. Restoring takes its own backup first, so it is itself undoable.
+""" % DEFAULT_BACKUP_DIR)
+    add_file(p, required=False)
+    p.add_argument("--list", action="store_true", help="show backups and stop")
+    p.add_argument("--backup", metavar="NAME",
+                   help="the backup to restore, by name or full path")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print a unified diff and change nothing")
+    add_json(p)
+    p.set_defaults(func=cmd_restore)
+
+    return parser
+
+
+# Commands that can write to the org file, and so should drain that file's
+# queue before acting. The rest only warn - a read must never have the side
+# effect of writing to the user's notes.
+WRITE_COMMANDS = frozenset(name for name, _ in dict(COMMAND_GROUPS)["WRITE"])
+
+
+def before_dispatch(args):
+    """Reconcile the queue for the file this command is about to touch."""
+    if args.cmd in ("pending", "sync", "restore"):
+        return  # these manage the queue; they must not recurse into it
+    try:
+        path = resolve_file(getattr(args, "file", None))
+    except UsageError:
+        return  # the command will raise its own, better error in a moment
+    if args.cmd in WRITE_COMMANDS and not getattr(args, "dry_run", False):
+        autosync(path)
+    else:
+        warn_pending(path)
+
+
+def main(argv=None):
+    global ARGV
+    ARGV = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        parser.print_help()
+        return EXIT_USAGE
+
+    if args.cmd == "todo" and not args.clear and not args.state:
+        parser.error("todo needs --state STATE or --clear")
+    if args.cmd == "tag" and not args.add and not args.remove:
+        parser.error("tag needs --add and/or --remove")
+
+    try:
+        arm_timeout()
+        before_dispatch(args)
+        return args.func(args)
+    except AmbiguousError as exc:
+        sys.stderr.write("orgcli: %s\n" % exc.message)
+        print_candidates(None, exc.candidates)
+        return exc.code
+    except OrgCliError as exc:
+        sys.stderr.write("orgcli: %s\n" % exc.message)
+        return exc.code
+    except BrokenPipeError:
+        # Must precede the OSError clause below - it is a subclass, and this
+        # one is not an error at all, just `| head`.
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        return EXIT_OK
+    except OSError as exc:
+        # Backstop. Every filesystem call worth naming is classified at its
+        # own call site; this makes sure the ones that are not still produce a
+        # usable exit code instead of a traceback.
+        err = classify_oserror(exc, getattr(exc, "filename", None))
+        sys.stderr.write("orgcli: %s\n" % err.message)
+        return err.code
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        disarm_timeout()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
